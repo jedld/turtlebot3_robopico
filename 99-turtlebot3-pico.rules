@@ -1,0 +1,36 @@
+# udev rules for Raspberry Pi Pico 2 boards used in TurtleBot3
+#
+# Install:
+#   sudo cp 99-turtlebot3-pico.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# After installation the devices appear as stable symlinks regardless of
+# plug-in order:
+#
+#   /dev/ttyTB3          — OpenCR emulator (turtlebot3_pico firmware, PID 0x000A)
+#   /dev/ttyLDS_CFG      — LDS-01 config port (lds01_emulator CDC0, PID 0x000B)
+#   /dev/ttyLDS          — LDS-01 LIDAR stream (lds01_emulator CDC1, PID 0x000B)
+#
+# Both firmwares use Raspberry Pi VID 0x2E8A.
+# The dual-CDC LIDAR emulator exposes two interfaces; they are identified by
+# the kernel-assigned interface number (ENV{ID_USB_INTERFACE_NUM}).
+
+# ── TurtleBot3 OpenCR emulator (single CDC, PID 0x000A) ──────────────────────
+SUBSYSTEM=="tty", \
+  ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000a", \
+  SYMLINK+="ttyTB3", MODE="0666", \
+  TAG+="uaccess"
+
+# ── LDS-01 LIDAR emulator — CDC0 config port (interface 0, PID 0x000B) ───────
+SUBSYSTEM=="tty", \
+  ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000b", \
+  ENV{ID_USB_INTERFACE_NUM}=="00", \
+  SYMLINK+="ttyLDS_CFG", MODE="0666", \
+  TAG+="uaccess"
+
+# ── LDS-01 LIDAR emulator — CDC1 LIDAR stream (interface 2, PID 0x000B) ──────
+SUBSYSTEM=="tty", \
+  ATTRS{idVendor}=="2e8a", ATTRS{idProduct}=="000b", \
+  ENV{ID_USB_INTERFACE_NUM}=="02", \
+  SYMLINK+="ttyLDS", MODE="0666", \
+  TAG+="uaccess"
