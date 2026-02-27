@@ -14,6 +14,10 @@ in 34 ms. The C firmware eliminates this by making `tud_cdc_line_state_cb()`
 a deliberate no-op. Everything else is a Dynamixel Protocol 2.0 slave that
 mirrors the OpenCR register map so `turtlebot3_bringup` works unchanged.
 
+Interfaces must be compatible with the turtlebot3, ROS and higher level drivers must think it is communicating with a turtlebot3 board, this includes all built-in devices like the IMU. If additional capabilities where to be added to the robopico by the grove port make the necessary bridge to make it compatible with the equivalent device in a real turtlebot3 like the IMU, unless the device is totally new and not in the real turtlebot3 e.g. ultrasonic sensor in that case make it at least Dynamixel compatible.
+
+Please refrain from changing the turtlebot 3 default drivers - it is a sign that the turtlebot3 pico firmware isn't fully compatible.
+
 Also the reference ROBO PICO SDK can be found in Cytron-ROBO-PICO to help with the Dynamixel bridge.
 
 ---
@@ -74,6 +78,122 @@ interface, which corrupts the Dynamixel binary protocol.
 
 The `r_i32` / `w_i32` / `r_f32` / `w_f32` helpers handle endianness; always
 use them rather than writing `regs[]` bytes directly for multi-byte types.
+
+---
+
+## BNO085 IMU — Grove 1 port integration
+
+### Hardware wiring
+
+Connect the BNO085 module to the **Grove 1** port on the Cytron Robo Pico:
+
+| Grove pin | Colour | Pico pin | BNO085 signal |
+|-----------|--------|----------|---------------|
+| 1 (signal 1) | Yellow | GP0 | SDA |
+| 2 (signal 2) | White  | GP1 | SCL |
+| 3 | Red   | 3.3 V | VCC |
+| 4 | Black | GND   | GND + SA0 (tie SA0 → GND for address 0x4A) |
+
+No INT or NRST pins are required — the driver polls over I2C only.
+
+### I2C address
+
+The default `BNO085_ADDR` is **0x4A** (SA0 tied to GND).  If your module
+ties SA0 to VCC, change the define near the top of the BNO085 section:
+```c
+#define BNO085_ADDR  0x4Bu   // SA0 = VCC
+```
+
+### Enabled sensor reports (all at 50 Hz)
+
+| Report ID | Sensor | Destination registers |
+|-----------|--------|-----------------------|
+| 0x05 | Rotation Vector (quaternion, fused) | ADDR_IMU_ORIENT_{W,X,Y,Z} |
+| 0x01 | Accelerometer | ADDR_IMU_LIN_ACC_{X,Y,Z} |
+| 0x02 | Gyroscope Calibrated | ADDR_IMU_ANG_VEL_{X,Y,Z} |
+| 0x0E | Magnetic Field Calibrated | ADDR_IMU_MAG_{X,Y,Z} |
+
+### Fallback behaviour
+
+If `init_bno085()` returns false (sensor absent or I2C timeout), `bno085_present`
+stays false and the firmware continues with the static simulated IMU
+(identity quaternion, Z-gravity).  The ROS bringup sequence will still
+print `IMU Calibration Done` and all topics remain live.
+
+### Rebuilding after changes to the BNO085 section
+
+```bash
+cd /home/jedld/turtlebot3_ws/turtlebot3_pico/firmware
+cmake --build build -- -j$(nproc)
+./build.sh flash
+```
+
+---
+
+## X-UPS1 UPS — Grove 6 port integration
+
+The Geekworm X-UPS1 is a 4-cell 18650 Li-Ion UPS (4S, ≈14.8 V nominal).
+It provides **no I2C interface** — only two active-HIGH binary GPIO signals.
+Grove 6 (GP26/GP27) is used exclusively for these signals; no IMU is on this port.
+
+### Hardware wiring
+
+The X-UPS1 ships with a PH2.0 4-pin cable.  Wiring split:
+
+| Cable pin | Colour | Function | Connect to |
+|-----------|--------|----------|------------|
+| 1 | Yellow | PLD (Power Loss Detect) | Grove 6, pin 1 → **GP26** |
+| 2 | White  | LBAT (Low Battery)      | Grove 6, pin 2 → **GP27** |
+| 3 | Red    | 5 V supply | Raspberry Pi 5 V rail |
+| 4 | Black  | GND        | Raspberry Pi GND |
+
+```
+X-UPS1                    Cytron Robo Pico (Grove 6)
+──────────────            ──────────────────────────────
+pin 1 (Yellow) PLD  ───── pin 1 (Yellow, GP26)
+pin 2 (White)  LBAT ───── pin 2 (White,  GP27)
+pin 3 (Red)    5 V  ─────────────────── Raspberry Pi 5 V
+pin 4 (Black)  GND  ─────────────────── Raspberry Pi GND
+```
+
+Both signals use **internal pull-downs** (`gpio_pull_down`); they read LOW when
+nothing is connected.
+
+### Signal semantics
+
+| Signal | GPIO | HIGH means | LOW means |
+|--------|------|------------|-----------|
+| PLD | GP26 | Mains disconnected — robot on battery | Mains present |
+| LBAT | GP27 | Pack ≤ 12 V (≤ 3 V/cell) — cut-off imminent | Battery OK |
+
+### Reported battery states
+
+The firmware maps the two signals to three discrete states:
+
+| `LBAT` | `PLD` | Reported voltage | Reported % | Meaning |
+|--------|-------|-----------------|------------|---------|
+| 1 | × | 12.0 V | 5 % | Critically low — cut-off imminent |
+| 0 | 1 | 14.8 V | 50 % | On battery, charge level unknown (> 25 %) |
+| 0 | 0 | 16.8 V | 100 % | On mains power / fully charged |
+
+Values are stored in the control table as integers (`volts × 100`, `pct × 100`).
+
+### Firmware functions
+
+- `init_ups_gpio()` — initialises GP26/GP27 as inputs with pull-downs; called
+  from `main()` during hardware init.
+- `update_sensors()` — reads `gpio_get(PIN_UPS_PLD)` and `gpio_get(PIN_UPS_LBAT)`,
+  maps to the three-state table above, and writes `ADDR_BATTERY_VOLTAGE` and
+  `ADDR_BATTERY_PERCENT`.  Also plays `MEL_LOW_BATT` once when LBAT asserts.
+
+### IMU selection priority
+
+At startup the firmware probes in this order and uses the first sensor found:
+
+1. **BNO085** on Grove 1 (GP0/GP1, I2C0) — preferred (SHTP sensor fusion)
+2. **Static simulated IMU** — if BNO085 is not detected
+
+`ADDR_DBG_IMU_SOURCE` is set to `1` (BNO085) or `0` (simulated) accordingly.
 
 ---
 

@@ -26,6 +26,7 @@ target_link_libraries(turtlebot3_pico_fw
     pico_stdlib
     hardware_pwm
     hardware_adc
+    hardware_i2c
     hardware_watchdog
     tinyusb_device
     tinyusb_board

@@ -1,0 +1,60 @@
+# =============================================================================
+# TurtleBot3 Pico — Custom Parameter Override
+# =============================================================================
+#
+# This file overrides the stock turtlebot3 burger.yaml parameters for the
+# Pico-based build (Cytron Robo Pico + TT motors + custom chassis).
+#
+# It is loaded instead of the default burger.yaml when launching via
+# flash_and_bringup.sh.  The original burger.yaml remains untouched so the
+# same SD card can be used on a stock TurtleBot3 Burger.
+#
+# When changing motors, wheels, or chassis, update both:
+#   1. This file        (ROS 2 side)
+#   2. firmware/main.c  (firmware side — WHEEL_RADIUS / WHEEL_SEPARATION)
+#
+# Current hardware:
+#   Motor  : Cytron TT Motor Dual Metal Shaft 1:48, 3–6 V DC
+#            https://www.cytron.io/p-tt-motor-dual-metal-shaft
+#   Wheel  : Cytron Small Robot Rubber Wheel 65×26.5 mm (68.1 mm OD with tyre)
+#            https://www.cytron.io/p-small-robot-rubber-wheel-65x26.5mm
+#   Chassis: Custom, 13.5 cm wheel-to-wheel separation
+# =============================================================================
+
+/**:
+  turtlebot3_node:
+    ros__parameters:
+
+      enable_stamped_cmd_vel: false
+
+      opencr:
+        id: 200
+        baud_rate: 1000000
+        protocol_version: 2.0
+
+      wheels:
+        separation: 0.135      # metres — custom chassis (13.5 cm)
+        radius: 0.10469        # metres — Cytron 65×26.5 mm rubber wheel (68.1 mm OD)
+
+      motors:
+        profile_acceleration_constant: 214.577
+
+        # [rev/min2]
+        # ref) http://emanual.robotis.com/docs/en/dxl/x/xl430-w250/#profile-acceleration
+        profile_acceleration: 0.0
+
+      sensors:
+        bumper_1: 0
+        bumper_2: 0
+        illumination: 0
+        ir: 0
+        sonar: 0
+/**:
+  diff_drive_controller:
+    ros__parameters:
+
+      odometry:
+        publish_tf: true
+        use_imu: false           # No IMU on Pico build — use wheel-only odometry
+        frame_id: "odom"
+        child_frame_id: "base_footprint"

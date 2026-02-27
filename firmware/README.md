@@ -43,7 +43,9 @@ the first PING in **< 10 ms** from any point after USB enumeration.
 | Button 1 | GP20 | active-low, internal pull-up |
 | Button 2 | GP21 | active-low, internal pull-up |
 | Buzzer | GP22 | variable-frequency PWM |
-| Battery ADC | GP29 | VSYS via 3:1 resistor divider |
+| Onboard LED | GP25 | motor-activity indicator |
+| Battery ADC | GP28 | Vbatt via 2:1 divider (solder pad) |
+| VSYS monitor | GP29 | VSYS via 3:1 resistor divider |
 
 ---
 

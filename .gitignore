@@ -1,0 +1,18 @@
+# Build output directories (CMake / Ninja)
+firmware/build/
+lds01_emulator/build/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / IDE
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
