@@ -33,8 +33,8 @@
         protocol_version: 2.0
 
       wheels:
-        separation: 0.135      # metres — custom chassis (13.5 cm)
-        radius: 0.10469        # metres — Cytron 65×26.5 mm rubber wheel (68.1 mm OD)
+        separation: 0.050000      # metres — custom chassis (13.5 cm)
+        radius: 0.36191        # metres — Cytron 65×26.5 mm rubber wheel (68.1 mm OD)
 
       motors:
         profile_acceleration_constant: 214.577

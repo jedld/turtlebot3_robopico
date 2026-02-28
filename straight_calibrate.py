@@ -5,13 +5,13 @@ straight_calibrate.py — Iterative straight-line calibration for TurtleBot3.
 Uses the front-facing LiDAR to measure actual travel distance and angular
 drift while driving perpendicular to a wall.  Computes corrections for:
 
-  1. WHEEL_RADIUS   — forward distance accuracy (LiDAR ground-truth vs odom)
+  1. MAX_WHEEL_SPEED_MS — forward distance accuracy (LiDAR ground-truth vs odom)
+     Only applied when wall metrics are trusted (robot ≤15° off-perpendicular).
   2. MOTOR_TRIM_LEFT / MOTOR_TRIM_RIGHT — per-motor duty to cancel lateral drift
      (measured from IMU yaw + LiDAR wall-plane angle change)
 
 The corrections are written back to:
-  • firmware/main.c          (WHEEL_RADIUS, MOTOR_TRIM_LEFT, MOTOR_TRIM_RIGHT)
-  • config/burger_pico.yaml  (wheels.radius)
+  • firmware/main.c  (MAX_WHEEL_SPEED_MS, MOTOR_TRIM_LEFT, MOTOR_TRIM_RIGHT)
 
 After updating, the script rebuilds and reflashes the firmware automatically,
 then runs one more verification pass to confirm calibration.
@@ -28,6 +28,7 @@ Options:
   --speed    M/S  forward speed                  (default 0.05)
   --passes   N    calibration passes to average  (default 3)
     --manual-start  fully manual start position for every pass (no auto-return)
+    --imu-only      calibrate straightness from IMU/odometry only (ignore LiDAR metrics)
   --no-flash      update files but skip rebuild/flash
   --verify-only   run one measurement pass, print results, exit (no changes)
 
@@ -70,6 +71,11 @@ SCAN_WINDOW_DEG = 40.0   # degrees either side of front used for wall-plane fit
 MIN_WALL_PTS    = 8      # minimum valid scan points for a reliable fit
 SETTLE_SEC      = 1.5    # pause after stopping before taking measurements
 RATE_HZ         = 20     # cmd_vel publish rate
+# Maximum |pre_wall_angle| for which LiDAR wall-plane metrics are trusted.
+# Beyond this the scan window is unevenly clipped, making the SVD normal vector
+# noisy: a few mm of forward motion produces tens of degrees of apparent drift
+# and the perpendicular-distance reading becomes unreliable.
+WALL_ANGLE_TRUST_DEG = 15.0
 
 # ─────────────────────────── correction damping ────────────────────────────
 # Apply only this fraction of the computed correction each pass to avoid
@@ -831,7 +837,8 @@ class Calibrator(Node):
         return angle_diff(target_yaw, self.imu_yaw)
 
     def return_to_start(self, target_dist: float, speed: float,
-                        pre_wall_dist: float | None, start_yaw: float) -> bool:
+                        pre_wall_dist: float | None, start_yaw: float,
+                        use_lidar: bool = True) -> bool:
         """
         Return the robot to its calibration start position using closed-loop
         wall-relative localisation at every step.
@@ -853,6 +860,46 @@ class Calibrator(Node):
           3. Final squaring — second _wall_align pass to remove residual angle
                               error accumulated during the reverse.
         """
+        if not use_lidar:
+            info("Returning to start (IMU + odometry, LiDAR ignored)…")
+            self._emergency_stop = False
+
+            # 1) Align heading back to the run-start yaw.
+            info("  [1/3] IMU yaw alignment to start heading…")
+            self._yaw_align(start_yaw)
+
+            # 2) Reverse by odometry distance while holding heading from IMU.
+            info(f"  [2/3] Reversing {target_dist*100:.0f} cm (odom target)…")
+            x0, y0 = self.odom_xy
+            t0 = time.time()
+            max_t = target_dist / speed * 3.5 + 3.0
+            stop_reason = "timeout"
+
+            while time.time() - t0 < max_t:
+                rclpy.spin_once(self, timeout_sec=0.05)
+                omega = self._imu.angular_velocity.z if self._imu is not None else 0.0
+                yaw_err = angle_diff(start_yaw, self.imu_yaw)
+                az = RETURN_LAT_KP * yaw_err - RETURN_LAT_KD * omega
+                az = max(-RETURN_LAT_MAX, min(RETURN_LAT_MAX, az))
+
+                dx = self._odom.pose.pose.position.x - x0
+                dy = self._odom.pose.pose.position.y - y0
+                if math.sqrt(dx*dx + dy*dy) >= target_dist:
+                    stop_reason = "odom distance"
+                    break
+
+                self._send_vel(-speed, az)
+
+            self._send_vel(0.0, 0.0)
+            info(f"        Stopped: {stop_reason}")
+            self.spin_for(RETURN_SETTLE_SEC)
+
+            # 3) Final heading touch-up.
+            info("  [3/3] Final IMU yaw alignment…")
+            residual = self._yaw_align(start_yaw)
+            ok(f"  Returned to start. Residual angle={math.degrees(residual):+.1f}°")
+            return True
+
         info("Returning to start (wall-relative localisation)…")
         self._emergency_stop = False
 
@@ -937,43 +984,62 @@ class Calibrator(Node):
         return True
 
     # ── core test pass ──────────────────────────────────────────────────────
-    def run_pass(self, target_dist: float, speed: float) -> dict | None:
+    def run_pass(self, target_dist: float, speed: float,
+                 use_lidar: bool = True) -> dict | None:
         """
         Drive forward `target_dist` metres at `speed` m/s while monitoring
         safety.  Returns a measurement dict or None on emergency stop.
         """
         self._emergency_stop = False
 
-        # --- Pre-run wall snapshot ---
-        info("Measuring wall state before run…")
-        pre_scans = self.snapshot_scans(SETTLE_SEC)
-        pre_wall_dist, pre_wall_angle = median_wall(pre_scans)
+        # --- Pre-run wall snapshot (optional) ---
+        if use_lidar:
+            info("Measuring wall state before run…")
+            pre_scans = self.snapshot_scans(SETTLE_SEC)
+            pre_wall_dist, pre_wall_angle = median_wall(pre_scans)
 
-        if pre_wall_dist is None:
-            warn("Could not fit wall plane before run (not enough scan pts).")
-        else:
-            info(f"  Wall: dist={pre_wall_dist:.4f} m  "
-                 f"angle={math.degrees(pre_wall_angle):+.2f}°")
-            if pre_wall_dist < WALL_STOP_M + target_dist + 0.15:
-                warn(f"Wall too close ({pre_wall_dist:.3f} m) to safely drive "
-                     f"{target_dist*100:.0f} cm.")
-                warn("  >>> Please move the robot further from the wall, "
-                     "then press Enter to retry, or Ctrl-C to abort. <<<")
-                try:
-                    input()
-                except EOFError:
-                    pass
-                # Re-measure after user repositions
-                pre_scans = self.snapshot_scans(SETTLE_SEC)
-                pre_wall_dist, pre_wall_angle = median_wall(pre_scans)
-                if pre_wall_dist is None:
-                    fail("Still cannot fit wall after repositioning.")
-                    return None
-                info(f"  Wall after reposition: dist={pre_wall_dist:.4f} m  "
+            if pre_wall_dist is None:
+                warn("Could not fit wall plane before run (not enough scan pts).")
+            else:
+                info(f"  Wall: dist={pre_wall_dist:.4f} m  "
                      f"angle={math.degrees(pre_wall_angle):+.2f}°")
                 if pre_wall_dist < WALL_STOP_M + target_dist + 0.15:
-                    fail(f"Wall still too close ({pre_wall_dist:.3f} m).  Aborting.")
-                    return None
+                    warn(f"Wall too close ({pre_wall_dist:.3f} m) to safely drive "
+                         f"{target_dist*100:.0f} cm.")
+                    warn("  >>> Please move the robot further from the wall, "
+                         "then press Enter to retry, or Ctrl-C to abort. <<<")
+                    try:
+                        input()
+                    except EOFError:
+                        pass
+                    # Re-measure after user repositions
+                    pre_scans = self.snapshot_scans(SETTLE_SEC)
+                    pre_wall_dist, pre_wall_angle = median_wall(pre_scans)
+                    if pre_wall_dist is None:
+                        fail("Still cannot fit wall after repositioning.")
+                        return None
+                    info(f"  Wall after reposition: dist={pre_wall_dist:.4f} m  "
+                         f"angle={math.degrees(pre_wall_angle):+.2f}°")
+                    if pre_wall_dist < WALL_STOP_M + target_dist + 0.15:
+                        fail(f"Wall still too close ({pre_wall_dist:.3f} m).  Aborting.")
+                        return None
+            # Warn if robot is too far off-perpendicular: the SVD fit will be
+            # unreliable, producing bogus distance and drift readings.
+            if pre_wall_angle is not None and \
+                    abs(pre_wall_angle) > math.radians(WALL_ANGLE_TRUST_DEG):
+                warn(f"Robot is {math.degrees(pre_wall_angle):+.1f}\u00b0 off-perpendicular "
+                     f"(trust limit \u00b1{WALL_ANGLE_TRUST_DEG:.0f}\u00b0). "
+                     "LiDAR distance and yaw-drift will be UNRELIABLE for this pass. "
+                     "Square the robot to face the wall for accurate results.")
+        else:
+            info("IMU-only mode: skipping LiDAR wall snapshots and distance fitting.")
+            pre_wall_dist, pre_wall_angle = None, None
+
+        # Wall metrics are reliable only when robot started near-perpendicular
+        wall_metrics_valid = (
+            pre_wall_angle is not None and
+            abs(pre_wall_angle) <= math.radians(WALL_ANGLE_TRUST_DEG)
+        )
 
         # --- Baseline pose ---
         x0, y0  = self.odom_xy
@@ -1006,9 +1072,12 @@ class Calibrator(Node):
         info("Settling…")
         self.spin_for(SETTLE_SEC)
 
-        # --- Post-run wall snapshot ---
-        post_scans = self.snapshot_scans(SETTLE_SEC)
-        post_wall_dist, post_wall_angle = median_wall(post_scans)
+        # --- Post-run wall snapshot (optional) ---
+        if use_lidar:
+            post_scans = self.snapshot_scans(SETTLE_SEC)
+            post_wall_dist, post_wall_angle = median_wall(post_scans)
+        else:
+            post_wall_dist, post_wall_angle = None, None
 
         # --- Final pose ---
         x1, y1  = self.odom_xy
@@ -1052,6 +1121,7 @@ class Calibrator(Node):
             "post_wall_dist":  post_wall_dist,
             "pre_wall_angle":  pre_wall_angle,
             "post_wall_angle": post_wall_angle,
+            "wall_metrics_valid": wall_metrics_valid,
             "start_yaw":       yaw0_i,   # IMU heading at run start (for auto-return)
         }
 
@@ -1083,12 +1153,20 @@ def aggregate(results):
         vals = [r[key] for r in results if r.get(key) is not None]
         return (sum(vals) / len(vals)) if vals else None
 
-    return {k: avg(k) for k in results[0].keys()}
+    agg = {k: avg(k) for k in results[0].keys() if k != "wall_metrics_valid"}
+    # Wall metrics are only trusted when ALL passes had a near-perpendicular start
+    agg["wall_metrics_valid"] = all(r.get("wall_metrics_valid", False) for r in results)
+    return agg
 
 
 def best_yaw_drift(r):
-    """Pick the most reliable yaw-drift estimate (LiDAR > IMU > odom)."""
-    if r["wall_drift"] is not None:
+    """Pick the most reliable yaw-drift estimate (LiDAR > IMU > odom).
+
+    LiDAR wall drift is only used when the robot was near-perpendicular
+    at the start of the pass (wall_metrics_valid=True).  Off-axis, the SVD
+    fit is ill-conditioned and produces spuriously large drift angles.
+    """
+    if r["wall_drift"] is not None and r.get("wall_metrics_valid", False):
         return r["wall_drift"], "LiDAR wall"
     if r["imu_drift"] is not None:
         return r["imu_drift"], "IMU"
@@ -1168,17 +1246,16 @@ def analyse_duty_sweep(sweep: list[dict],
 # File updates
 # ═══════════════════════════════════════════════════════════════════════════
 
-def apply_corrections(new_radius, new_trim_l, new_trim_r,
-                      old_radius, old_trim_l, old_trim_r,
+def apply_corrections(new_max_speed, new_trim_l, new_trim_r,
+                      old_max_speed, old_trim_l, old_trim_r,
                       new_min_duty=None, old_min_duty=None,
                       new_kick_duty=None, old_kick_duty=None):
     hdr("Applying corrections to source files")
 
-    info(f"WHEEL_RADIUS  : {old_radius:.6f} → {new_radius:.6f} m")
-    write_firmware_float(MAIN_C, "WHEEL_RADIUS", new_radius,
-                         f"metres — calibrated ({new_radius*2*1000:.1f} mm diam. effective)")
-    write_yaml_radius(YAML_PATH, new_radius)
-    ok("WHEEL_RADIUS updated in firmware/main.c and config/burger_pico.yaml")
+    info(f"MAX_WHEEL_SPEED_MS : {old_max_speed:.6f} → {new_max_speed:.6f} m/s")
+    write_firmware_float(MAIN_C, "MAX_WHEEL_SPEED_MS", new_max_speed,
+                         f"calibrated — straight_calibrate.py")
+    ok("MAX_WHEEL_SPEED_MS updated in firmware/main.c")
 
     info(f"MOTOR_TRIM_LEFT  : {old_trim_l:.6f} → {new_trim_l:.6f}")
     write_firmware_float(MAIN_C, "MOTOR_TRIM_LEFT", new_trim_l,
@@ -1247,6 +1324,8 @@ def main():
                     help="Calibration passes to average (default 3)")
     ap.add_argument("--manual-start", action="store_true",
                     help="Manually place robot before every pass (disable auto-return)")
+    ap.add_argument("--imu-only", action="store_true",
+                    help="Calibrate straightness using IMU/odometry only (ignore LiDAR metrics)")
     ap.add_argument("--no-flash",    action="store_true",
                     help="Update files but skip rebuild/flash")
     ap.add_argument("--verify-only", action="store_true",
@@ -1263,9 +1342,14 @@ def main():
           f"{args.speed*100:.1f} cm/s")
     print(f"  Averaging       : {args.passes} passes")
     print(f"  Start mode      : {'manual every pass' if args.manual_start else 'manual first + auto-return'}")
+    print(f"  Drift source    : {'IMU only (LiDAR ignored)' if args.imu_only else 'LiDAR+IMU'}")
     print(f"  Safety stop     : front < {WALL_STOP_M} m")
-    print(f"\n{YLW}Place the robot perpendicular to a flat wall, at")
-    print(f"least {WALL_STOP_M + args.distance + 0.20:.2f} m away, and press Enter to start.{NC}")
+    if args.imu_only:
+        print(f"\n{YLW}IMU-only mode: LiDAR is not used for calibration math.{NC}")
+        print(f"{YLW}Place the robot in open space with clear forward safety margin and press Enter to start.{NC}")
+    else:
+        print(f"\n{YLW}Place the robot perpendicular to a flat wall, at")
+        print(f"least {WALL_STOP_M + args.distance + 0.20:.2f} m away, and press Enter to start.{NC}")
     try:
         input()
     except EOFError:
@@ -1281,23 +1365,23 @@ def main():
     ok("Sensors ready.")
 
     # Read current firmware values
-    cur_radius    = read_firmware_float(MAIN_C, "WHEEL_RADIUS")
+    cur_max_speed = read_firmware_float(MAIN_C, "MAX_WHEEL_SPEED_MS")
     cur_trim_l    = read_firmware_float(MAIN_C, "MOTOR_TRIM_LEFT")
     cur_trim_r    = read_firmware_float(MAIN_C, "MOTOR_TRIM_RIGHT")
     wheel_sep     = read_firmware_float(MAIN_C, "WHEEL_SEPARATION")
     cur_min_duty  = read_firmware_float(MAIN_C, "MOTOR_MIN_DUTY")
     cur_kick_duty = read_firmware_float(MAIN_C, "MOTOR_KICK_DUTY")
 
-    if None in (cur_radius, cur_trim_l, cur_trim_r, wheel_sep):
+    if None in (cur_max_speed, cur_trim_l, cur_trim_r, wheel_sep):
         fail("Could not read current firmware parameters from main.c")
         rclpy.shutdown(); sys.exit(1)
 
-    info(f"Current WHEEL_RADIUS     = {cur_radius:.6f} m")
-    info(f"Current MOTOR_TRIM_LEFT  = {cur_trim_l:.6f}")
-    info(f"Current MOTOR_TRIM_RIGHT = {cur_trim_r:.6f}")
-    info(f"Current WHEEL_SEPARATION = {wheel_sep:.6f} m")
+    info(f"Current MAX_WHEEL_SPEED_MS = {cur_max_speed:.6f} m/s")
+    info(f"Current MOTOR_TRIM_LEFT    = {cur_trim_l:.6f}")
+    info(f"Current MOTOR_TRIM_RIGHT   = {cur_trim_r:.6f}")
+    info(f"Current WHEEL_SEPARATION   = {wheel_sep:.6f} m")
     if cur_min_duty is not None:
-        info(f"Current MOTOR_MIN_DUTY   = {cur_min_duty:.4f}")
+        info(f"Current MOTOR_MIN_DUTY     = {cur_min_duty:.4f}")
     if cur_kick_duty is not None:
         info(f"Current MOTOR_KICK_DUTY  = {cur_kick_duty:.4f}")
 
@@ -1375,8 +1459,9 @@ def main():
                 speed          = args.speed,
                 pre_wall_dist  = prev["pre_wall_dist"],
                 start_yaw      = prev["start_yaw"],
+                use_lidar      = not args.imu_only,
             )
-        r = node.run_pass(args.distance, args.speed)
+        r = node.run_pass(args.distance, args.speed, use_lidar=not args.imu_only)
         if r is None:
             fail("Pass aborted (safety stop or no movement).")
             rclpy.shutdown(); sys.exit(1)
@@ -1394,15 +1479,24 @@ def main():
     drift, drift_src = best_yaw_drift(avg)
     info(f"Avg yaw drift     : {math.degrees(drift):+.3f}°  (source: {drift_src})")
 
+    wall_trusted = avg.get("wall_metrics_valid", False)
+
     if args.verify_only:
         hdr("Verification summary (no changes applied)")
         lat_mm  = abs(avg['odom_lat']) * 1000
-        fwd_err = (avg['odom_fwd'] - args.distance) / args.distance * 100
-        print(f"  Forward error  : {fwd_err:+.1f}%")
+        if wall_trusted and avg["lidar_dist"] is not None:
+            dist_err = (avg["lidar_dist"] - args.distance) / args.distance * 100
+            print(f"  Distance error : {dist_err:+.1f}%  "
+                  f"(LiDAR {avg['lidar_dist']*100:.2f} cm vs commanded {args.distance*100:.0f} cm)")
+        else:
+            fwd_err = (avg['odom_fwd'] - args.distance) / args.distance * 100
+            print(f"  Forward error  : {fwd_err:+.1f}%  (odom only — LiDAR not trusted)")
         print(f"  Lateral drift  : {lat_mm:.1f} mm "
               f"({'LEFT' if avg['odom_lat'] > 0 else 'RIGHT'})")
-        print(f"  Yaw drift      : {math.degrees(drift):+.2f}°")
-        if abs(fwd_err) < 3 and abs(math.degrees(drift)) < 1:
+        print(f"  Yaw drift      : {math.degrees(drift):+.2f}°  (source: {drift_src})")
+        if not wall_trusted:
+            warn("LiDAR wall metrics not trusted (robot off-perpendicular).")
+        if abs(math.degrees(drift)) < 1:
             ok("Robot is already well-calibrated!")
         else:
             warn("Calibration recommended.  Rerun without --verify-only.")
@@ -1411,25 +1505,32 @@ def main():
     # ── Compute new parameters ──
     hdr("Computing corrections")
 
-    # 1. Wheel radius from LiDAR ground-truth distance
-    if lidar_available and avg["lidar_dist"] > 0.01:
-        new_radius = compute_radius_correction(
-            avg["odom_dist"], avg["lidar_dist"], cur_radius)
-        info(f"Radius correction: {cur_radius:.6f} → {new_radius:.6f} m  "
-             f"(odom {avg['odom_dist']*100:.2f} cm vs LiDAR {avg['lidar_dist']*100:.2f} cm)")
+    # 1. MAX_WHEEL_SPEED_MS from LiDAR ground-truth distance (only when wall trusted)
+    if wall_trusted and avg["lidar_dist"] is not None and avg["lidar_dist"] > 0.01 \
+            and avg["odom_dist"] is not None and avg["odom_dist"] > 0.01:
+        ratio = avg["lidar_dist"] / avg["odom_dist"]
+        new_max_speed = max(0.05, min(2.0, cur_max_speed * ratio))
+        info(f"MAX_WHEEL_SPEED_MS: {cur_max_speed:.6f} → {new_max_speed:.6f} m/s  "
+             f"(LiDAR {avg['lidar_dist']*100:.2f} cm vs odom {avg['odom_dist']*100:.2f} cm, "
+             f"ratio {ratio:.4f})")
     else:
-        new_radius = cur_radius
-        warn("No reliable LiDAR distance — WHEEL_RADIUS unchanged.")
+        new_max_speed = cur_max_speed
+        if not wall_trusted:
+            warn("LiDAR not trusted (robot off-perpendicular) — MAX_WHEEL_SPEED_MS unchanged.")
+        else:
+            warn("No reliable LiDAR distance — MAX_WHEEL_SPEED_MS unchanged.")
 
     # 2. Motor trim from yaw drift
-    travel = avg["lidar_dist"] if lidar_available else avg["odom_fwd"]
+    # Use LiDAR distance for travel if trusted, else fall back to odom
+    travel = avg["lidar_dist"] if (wall_trusted and avg["lidar_dist"] is not None) \
+             else avg["odom_fwd"]
     new_trim_l, new_trim_r = compute_trim_correction(
         drift, travel, wheel_sep, cur_trim_l, cur_trim_r)
     info(f"Trim correction: L {cur_trim_l:.6f} → {new_trim_l:.6f}  "
          f"R {cur_trim_r:.6f} → {new_trim_r:.6f}")
     info(f"  (yaw drift {math.degrees(drift):+.2f}° over "
          f"{travel*100:.1f} cm @ sep={wheel_sep*100:.1f} cm, "
-         f"damp={CORRECTION_DAMP:.0%})")
+         f"damp={CORRECTION_DAMP:.0%}, source: {drift_src})")
 
     # Sanity-check: if drift is negligible, keep existing trims
     if abs(math.degrees(drift)) < 0.5:
@@ -1437,8 +1538,8 @@ def main():
         new_trim_l, new_trim_r = cur_trim_l, cur_trim_r
 
     # ── Apply to files ──
-    apply_corrections(new_radius, new_trim_l, new_trim_r,
-                      cur_radius, cur_trim_l, cur_trim_r)
+    apply_corrections(new_max_speed, new_trim_l, new_trim_r,
+                      cur_max_speed, cur_trim_l, cur_trim_r)
 
     if args.no_flash:
         warn("--no-flash: files updated but firmware NOT rebuilt.")

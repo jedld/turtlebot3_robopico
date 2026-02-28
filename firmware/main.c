@@ -98,14 +98,11 @@
 //   turtlebot3_bringup/param/humble/burger.yaml
 // ============================================================
 
-#define WHEEL_RADIUS        0.104689f  // metres — calibrated (209.4 mm diam. effective)
-#define WHEEL_SEPARATION    0.135f   // metres (centre-to-centre, 13.5 cm)
-#define MAX_WHEEL_SPEED_MS  0.117f   // m/s — throttle scaling factor for open-loop control
-                                     // Not the physical max speed; determines the duty cycle
-                                     // applied per unit of commanded velocity.
-                                     // Cytron TT DC Dual Metal Gearbox Motor (1:90) @ 3.7 V ≈ 62 RPM no-load
-                                     // → π × 0.0681 × 62 / 60 ≈ 0.22 m/s theoretical max
-#define ANGULAR_CMD_SCALE   0.050000f    // 90° command turning ~180° => scale angular command by 0.5
+#define WHEEL_RADIUS        0.361910f  // metres — calibrated (723.8 mm diam. effective)
+// ANGULAR CALIBRATION: do NOT use a scale factor (it breaks odometry).
+// Tune WHEEL_SEPARATION to match effective turning base; run auto_calibrate_imu_turn.py.
+#define WHEEL_SEPARATION    0.063355f  // metres — effective turning base; calibrated by auto_calibrate_imu_turn.py
+#define MAX_WHEEL_SPEED_MS  0.336960f  // calibrated — straight_calibrate.py
 #define RIGHT_MOTOR_REVERSED 0       // set to 1 if right wheel spins backward
 #define SWAP_LEFT_RIGHT_MOTORS 1      // set to 1 if M1/M2 are physically wired to opposite sides
 
@@ -1425,7 +1422,7 @@ static void update_odometry(float dt) {
             // ROS node writes velocity in 0.01 m/s and 0.01 rad/s integer units.
             // Divide by 100 to recover SI values.
             lin_x = (float)r_i32(ADDR_CMD_LINEAR_X)  / 100.0f;  // → m/s
-            ang_z = ((float)r_i32(ADDR_CMD_ANGULAR_Z) / 100.0f) * ANGULAR_CMD_SCALE;  // → rad/s (calibrated)
+            ang_z = (float)r_i32(ADDR_CMD_ANGULAR_Z) / 100.0f;   // → rad/s
         }
         // else: no velocity written yet, or host timed out → lin_x/ang_z stay 0
     }
@@ -1434,9 +1431,10 @@ static void update_odometry(float dt) {
     float v_right = lin_x + ang_z * (WHEEL_SEPARATION / 2.0f);
 
     // Drive motors — apply per-motor trim before dead-zone/kick logic
+    float thr_l = 0.0f, thr_r = 0.0f;
     if (torque_on) {
-        float thr_l = (v_left  / MAX_WHEEL_SPEED_MS) * MOTOR_TRIM_LEFT;
-        float thr_r = (v_right / MAX_WHEEL_SPEED_MS) * MOTOR_TRIM_RIGHT;
+        thr_l = (v_left  / MAX_WHEEL_SPEED_MS) * MOTOR_TRIM_LEFT;
+        thr_r = (v_right / MAX_WHEEL_SPEED_MS) * MOTOR_TRIM_RIGHT;
         if (SWAP_LEFT_RIGHT_MOTORS) {
             set_motor(pwm_slice_m1, RIGHT_MOTOR_REVERSED, thr_r, 1);
             set_motor(pwm_slice_m2, false,               thr_l, 0);
@@ -1451,13 +1449,41 @@ static void update_odometry(float dt) {
         gpio_put(PIN_LED, false);
     }
 
-    // Wheel velocities (Dynamixel RPM units)
-    w_i32(ADDR_PRESENT_VEL_L, (int32_t)(v_left  * RPM_PER_MS));
-    w_i32(ADDR_PRESENT_VEL_R, (int32_t)(v_right * RPM_PER_MS));
+    // Compute the effective velocity that matches what set_motor() actually applies.
+    // set_motor() expands [0.001, 1.0] → [MOTOR_MIN_DUTY, 1.0] (dead-zone compensation).
+    // Using the raw commanded v_left/v_right for tick accumulation would make odom
+    // under-report actual motion, causing move_distance to stop too early (e.g. 5 cm
+    // instead of 10 cm).  Apply the same expansion here so ticks reflect real motion.
+    //
+    // We use the UNTRIMMED throttle (v / MAX_WHEEL_SPEED_MS, no MOTOR_TRIM factor)
+    // so that straight-line distance odom is unaffected by trim asymmetry corrections —
+    // trim accounts for motor hardware differences, not for the commanded trajectory.
+    float eff_v_left  = 0.0f;
+    float eff_v_right = 0.0f;
+    if (torque_on) {
+        float raw_l = fabsf(v_left  / MAX_WHEEL_SPEED_MS);
+        float raw_r = fabsf(v_right / MAX_WHEEL_SPEED_MS);
+        if (raw_l > 0.001f) {
+            float eff_l = (MOTOR_MIN_DUTY > 0.0f)
+                          ? MOTOR_MIN_DUTY + raw_l * (1.0f - MOTOR_MIN_DUTY)
+                          : raw_l;
+            eff_v_left  = (v_left  >= 0.0f ? 1.0f : -1.0f) * eff_l * MAX_WHEEL_SPEED_MS;
+        }
+        if (raw_r > 0.001f) {
+            float eff_r = (MOTOR_MIN_DUTY > 0.0f)
+                          ? MOTOR_MIN_DUTY + raw_r * (1.0f - MOTOR_MIN_DUTY)
+                          : raw_r;
+            eff_v_right = (v_right >= 0.0f ? 1.0f : -1.0f) * eff_r * MAX_WHEEL_SPEED_MS;
+        }
+    }
 
-    // Wheel positions (accumulating ticks)
-    float d_rad_l = (v_left  * dt) / WHEEL_RADIUS;
-    float d_rad_r = (v_right * dt) / WHEEL_RADIUS;
+    // Wheel velocities (Dynamixel RPM units) — report effective velocity
+    w_i32(ADDR_PRESENT_VEL_L, (int32_t)(eff_v_left  * RPM_PER_MS));
+    w_i32(ADDR_PRESENT_VEL_R, (int32_t)(eff_v_right * RPM_PER_MS));
+
+    // Wheel positions (accumulating ticks) — use effective velocity
+    float d_rad_l = (eff_v_left  * dt) / WHEEL_RADIUS;
+    float d_rad_r = (eff_v_right * dt) / WHEEL_RADIUS;
 
     int64_t new_l = (int64_t)pos_left_ticks  + (int64_t)(d_rad_l * TICKS_PER_RAD);
     int64_t new_r = (int64_t)pos_right_ticks + (int64_t)(d_rad_r * TICKS_PER_RAD);
