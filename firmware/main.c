@@ -101,8 +101,8 @@
 #define WHEEL_RADIUS        0.361910f  // metres — calibrated (723.8 mm diam. effective)
 // ANGULAR CALIBRATION: do NOT use a scale factor (it breaks odometry).
 // Tune WHEEL_SEPARATION to match effective turning base; run auto_calibrate_imu_turn.py.
-#define WHEEL_SEPARATION    0.063355f  // metres — effective turning base; calibrated by auto_calibrate_imu_turn.py
-#define MAX_WHEEL_SPEED_MS  0.336960f  // calibrated — straight_calibrate.py
+#define WHEEL_SEPARATION    0.074968f  // metres — effective turning base; calibrated by auto_calibrate_imu_turn.py
+#define MAX_WHEEL_SPEED_MS  2.000000f  // calibrated — straight_calibrate.py
 #define RIGHT_MOTOR_REVERSED 0       // set to 1 if right wheel spins backward
 #define SWAP_LEFT_RIGHT_MOTORS 1      // set to 1 if M1/M2 are physically wired to opposite sides
 
@@ -1389,9 +1389,13 @@ static bool init_bno085(void) {
     // Wait for initial sensor reports to arrive (rotation vector must appear).
     bno085_wait_for_calibration(1000u);
 
-    // Persist calibration offsets so subsequent power-ups start with good values.
-    bno085_save_dcd();
-    sleep_ms(10u);
+    // NOTE: Do NOT call bno085_save_dcd() here.
+    // The BNO085 automatically loads its previously-saved DCD at boot.
+    // Calling save_dcd() immediately after only ~1 s of ME calibration
+    // overwrites that good saved DCD with unconverged accelerometer offsets,
+    // which is the root cause of the gravity reading being ~9.5 instead of
+    // 9.81 m/s².  DCD is saved only on an explicit ADDR_IMU_RECAL trigger
+    // after a proper calibration wait.
 
     return true;
 }
@@ -1553,17 +1557,41 @@ static void update_sensors(uint64_t now_us) {
         start_melody(snd);
     }
 
-    // IMU re-calibration trigger (host writes 1 to ADDR_IMU_RECAL).
-    // Performs a real hardware recalibration on whichever IMU is connected,
-    // or resets to static identity values if no hardware IMU is present.
-    if (regs[ADDR_IMU_RECAL] == 1) {
+    // IMU re-calibration trigger:
+    //   Write 1 → recalibrate: enable ME cal, wait 5 s for convergence, save DCD.
+    //   Write 2 → clear DCD:   disable all ME cal, save (zeroing the flash DCD),
+    //             then re-enable ME cal so the sensor reverts to factory offsets.
+    if (regs[ADDR_IMU_RECAL] == 2) {
         if (bno085_present) {
-            // Re-enable ME calibration (resets internal offsets) and persist
-            // the updated calibration data to on-chip flash.
-            bno085_enable_me_calibration();
-            sleep_ms(10u);
+            // Disable all ME calibration channels and immediately save the empty
+            // (zero-offset) calibration to flash.  On the next boot the BNO085
+            // will load these zero offsets, effectively restoring factory defaults.
+            uint8_t cmd[12] = {0};
+            cmd[0] = SH2_COMMAND_REQUEST;
+            cmd[1] = bno085_cmd_seq++;
+            cmd[2] = SH2_CMD_ME_CAL;
+            // P1-P3 = 0: disable accel / gyro / mag calibration
+            shtp_send(SHTP_CH_CONTROL, cmd, sizeof(cmd));
+            sleep_ms(20u);
             bno085_save_dcd();
-            sleep_ms(10u);
+            sleep_ms(20u);
+            // Re-enable ME calibration for normal operation going forward
+            bno085_enable_me_calibration();
+            sleep_ms(20u);
+        }
+        regs[ADDR_IMU_RECAL] = 0;
+    } else if (regs[ADDR_IMU_RECAL] == 1) {
+        if (bno085_present) {
+            // Re-enable ME calibration so the BNO085 ME engine starts
+            // accumulating fresh calibration from the current sensor data.
+            // Then wait 5 s for accel/gyro/mag offsets to converge before
+            // saving to flash.  Saving after only a few ms (as was done
+            // before) persists unconverged offsets and causes the gravity
+            // reading to drift away from 9.81 m/s².
+            bno085_enable_me_calibration();
+            bno085_wait_for_calibration(5000u);
+            bno085_save_dcd();
+            sleep_ms(20u);
         } else {
             // No hardware IMU — reset to static identity values
             w_f32(ADDR_IMU_ORIENT_W,  1.0f);

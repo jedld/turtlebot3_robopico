@@ -169,27 +169,61 @@ wait_for_bootsel() {
     return 1
 }
 
-# Wait for the CDC serial port to reappear after flashing.
+# Wait for the TurtleBot3 Pico CDC port to reappear after flashing.
+# We wait for the udev SYMLINK /dev/ttyTB3 (created by 99-turtlebot3-pico.rules)
+# rather than a raw /dev/ttyACM* node, because:
+#   - The ACM number can change between flash cycles.
+#   - The bringup service and launch files reference /dev/ttyTB3.
+#   - udev needs ~1 s after the ACM node appears to process rules and create
+#     the symlink; waiting for the symlink guarantees it is ready.
 wait_for_cdc() {
-    echo "Waiting for CDC serial port (up to 10 s)..."
-    for _i in $(seq 1 50); do
-        if ls /dev/ttyACM* &>/dev/null; then
-            local port
-            port=$(ls /dev/ttyACM* 2>/dev/null | head -1)
-            echo "  Serial port: ${port}"
+    echo "Waiting for /dev/ttyTB3 udev symlink (up to 15 s)..."
+    for _i in $(seq 1 75); do
+        if [[ -L /dev/ttyTB3 ]]; then
+            local target
+            target=$(readlink -f /dev/ttyTB3)
+            echo "  /dev/ttyTB3 → ${target}"
             return 0
         fi
         sleep 0.2
     done
+    # Fallback: if the symlink is not created (udev rules not installed),
+    # accept any /dev/ttyACM* so the flash is not reported as failed.
+    if ls /dev/ttyACM* &>/dev/null; then
+        local port
+        port=$(ls /dev/ttyACM* 2>/dev/null | head -1)
+        echo "  WARNING: /dev/ttyTB3 symlink not found — udev rules may not be installed."
+        echo "  Raw port: ${port}"
+        return 0
+    fi
     return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Restart TurtleBot3 services after a successful flash
+# ─────────────────────────────────────────────────────────────────────────────
+do_restart_services() {
+    echo "Restarting TurtleBot3 services..."
+    if systemctl is-active --quiet turtlebot3-bringup.service 2>/dev/null || \
+       systemctl is-failed --quiet turtlebot3-bringup.service 2>/dev/null; then
+        sudo systemctl restart turtlebot3-bringup.service && \
+            echo "  turtlebot3-bringup.service restarted." || \
+            echo "  WARNING: failed to restart turtlebot3-bringup.service"
+    else
+        echo "  turtlebot3-bringup.service is not enabled — skipping."
+    fi
+    if systemctl is-active --quiet turtlebot3-camera.service 2>/dev/null || \
+       systemctl is-failed --quiet turtlebot3-camera.service 2>/dev/null; then
+        sudo systemctl restart turtlebot3-camera.service && \
+            echo "  turtlebot3-camera.service restarted." || \
+            echo "  WARNING: failed to restart turtlebot3-camera.service"
+    fi
 }
 
 do_flash() {
     local uf2="$BUILD_DIR/turtlebot3_pico_fw.uf2"
-    if [[ ! -f "$uf2" ]]; then
-        echo "UF2 not found — building first..."
-        do_build
-    fi
+    # Always build first so the flashed image reflects any source changes.
+    do_build
 
     echo "=== Flashing firmware ==="
     echo "    UF2: $uf2"
@@ -265,16 +299,14 @@ do_flash() {
     if wait_for_cdc; then
         echo ""
         echo "=== Flash complete! ==="
-        echo ""
-        echo "Run bringup with:"
-        echo "  source ~/turtlebot3_ws/install/setup.bash"
-        echo "  TURTLEBOT3_MODEL=burger LDS_MODEL=LDS-03 \\"
-        echo "  ros2 launch turtlebot3_bringup robot.launch.py usb_port:=/dev/ttyACM0"
+        do_restart_services
     else
         echo ""
-        echo "=== Flash sent — device did not re-enumerate as CDC within 10 s ==="
-        echo "This may be normal if the USB cable was disconnected."
-        echo "Check: ls /dev/ttyACM*"
+        echo "=== Flash sent — /dev/ttyTB3 did not appear within 15 s ==="
+        echo "Check: ls -la /dev/ttyTB3 /dev/ttyACM*"
+        echo "If /dev/ttyTB3 is missing, reinstall udev rules:"
+        echo "  sudo cp 99-turtlebot3-pico.rules /etc/udev/rules.d/"
+        echo "  sudo udevadm control --reload-rules && sudo udevadm trigger"
     fi
 }
 
@@ -283,12 +315,13 @@ do_flash() {
 # ─────────────────────────────────────────────────────────────────────────────
 CMD="${1:-build}"
 case "$CMD" in
-    install) do_install ;;
-    build)   do_build ;;
-    flash)   do_flash ;;
-    all)     do_install; do_build; do_flash ;;
+    install)  do_install ;;
+    build)    do_build ;;
+    flash)    do_flash ;;
+    restart)  do_restart_services ;;
+    all)      do_install; do_flash ;;
     *)
-        echo "Usage: $0 [install|build|flash|all]"
+        echo "Usage: $0 [install|build|flash|restart|all]"
         exit 1
         ;;
 esac
