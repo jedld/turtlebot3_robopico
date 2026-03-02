@@ -17,7 +17,7 @@ increase it.
     new_separation = old_separation * (desired_angle / measured_angle)
 
 The same value must be set in BOTH:
-  - firmware/main.c          (#define WHEEL_SEPARATION)
+    - firmware/main.c          (#define WHEEL_SEPARATION_DEFAULT)
   - config/burger_pico.yaml  (wheels.separation)
 
 IMU usage
@@ -66,8 +66,8 @@ Usage
   # Apply to files:
   python3 auto_calibrate_imu_turn.py --apply
 
-  # Apply + rebuild + flash + restart service:
-  python3 auto_calibrate_imu_turn.py --apply --flash
+    # Apply and persist to firmware flash (no reflash needed):
+    python3 auto_calibrate_imu_turn.py --apply
 
   # Custom test parameters:
   python3 auto_calibrate_imu_turn.py --speed 0.4 --angle 180 --runs 3 --apply
@@ -82,12 +82,14 @@ Usage
 import argparse
 import math
 import re
+import struct
 import subprocess
 import time
 from pathlib import Path
 from typing import NamedTuple, Optional
 
 import numpy as np
+import serial
 
 import rclpy
 from geometry_msgs.msg import Twist
@@ -102,6 +104,74 @@ YAML_PATH    = SCRIPT_DIR / "config" / "burger_pico.yaml"
 FIRMWARE_DIR = SCRIPT_DIR / "firmware"
 BUILD_SCRIPT = FIRMWARE_DIR / "build.sh"
 
+DEV_ID = 200
+DXL_BAUD = 1_000_000
+INST_CALIBRATION = 0x90
+CALIB_CMD_SET = 0x01
+CALIB_CMD_SAVE = 0x04
+CALIB_CMD_RESET = 0x03
+CALIB_CMD_RESET_AND_SAVE = 0x06
+CALIB_KEY_WHEEL_SEPARATION = 0x02
+CALIB_KEY_MAX_WHEEL_SPEED_MS = 0x03
+CALIB_KEY_MOTOR_MIN_DUTY     = 0x04
+CALIB_KEY_MOTOR_KICK_DUTY    = 0x05
+CALIB_KEY_MOTOR_KICK_CYCLES  = 0x06
+CALIB_KEY_MOTOR_TRIM_LEFT    = 0x07
+CALIB_KEY_MOTOR_TRIM_RIGHT   = 0x08
+
+
+def _make_crc_table() -> list[int]:
+    table = []
+    for i in range(256):
+        crc = i << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x8005) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+        table.append(crc)
+    return table
+
+
+_CRC_TABLE = _make_crc_table()
+
+
+def _crc16(data: bytes) -> int:
+    crc = 0
+    for b in data:
+        crc = ((crc << 8) ^ _CRC_TABLE[((crc >> 8) ^ b) & 0xFF]) & 0xFFFF
+    return crc
+
+
+def _build_instruction(dev_id: int, inst: int, params: bytes) -> bytes:
+    pkt_len = len(params) + 3
+    hdr = bytes([
+        0xFF, 0xFF, 0xFD, 0x00,
+        dev_id,
+        pkt_len & 0xFF,
+        (pkt_len >> 8) & 0xFF,
+        inst,
+    ])
+    pkt = hdr + params
+    crc = _crc16(pkt)
+    return pkt + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+
+
+def send_calib_command(port: str, subcmd: int, key: int | None = None,
+                       value: float | None = None, dev_id: int = DEV_ID) -> None:
+    params = bytes([subcmd])
+    if subcmd == CALIB_CMD_SET:
+        if key is None or value is None:
+            raise ValueError("SET requires key and value")
+        params += bytes([key]) + struct.pack("<f", float(value))
+
+    # Broadcast avoids status replies, preventing RX contention with bringup.
+    pkt = _build_instruction(0xFE, INST_CALIBRATION, params)
+    with serial.Serial(port, DXL_BAUD, timeout=0.02, write_timeout=0.2) as ser:
+        ser.write(pkt)
+        ser.flush()
+    time.sleep(0.02)
+
 # Angular velocity variance threshold to distinguish real BNO085 from simulated
 REAL_IMU_GYRO_VAR_THRESHOLD = 1e-5   # rad^2/s^2
 
@@ -109,6 +179,25 @@ REAL_IMU_GYRO_VAR_THRESHOLD = 1e-5   # rad^2/s^2
 SIGMA_IMU       = 1.5   # gyro drift + integration error
 SIGMA_LIDAR_FFT = 0.30  # FFT + sub-pixel interpolation
 SIGMA_LIDAR_SVD = 0.40  # SVD Procrustes alignment
+
+# Outlier detection — ratio of measured/target angle
+MIN_ANGLE_RATIO = 0.30   # <30% of target → likely a motor didn't move
+MAX_ANGLE_RATIO = 1.50   # >150% of target → overshoot (tighter than before)
+DEFAULT_MAX_RETRIES = 3  # per-run retry limit before giving up on that run
+
+# IMU safety cutoff — stop the motors mid-rotation if IMU already
+# exceeds this multiple of the target angle.  Prevents multi-rotation
+# spins caused by dead-zone compensation dominating small commands.
+IMU_SAFETY_CUTOFF_RATIO = 1.15   # stop at 115% of target (closed-loop margin)
+
+# Maximum correction per iteration step.  A single bad measurement
+# (e.g. 10° when expecting 180°) would otherwise multiply separation
+# by 18×.  Clamp the raw correction to [1-MAX, 1+MAX].
+MAX_CORRECTION_PER_STEP = 0.40   # ±40% per run
+
+# Reasonable range for WHEEL_SEPARATION in metres
+MIN_REASONABLE_SEP = 0.05   # 5 cm
+MAX_REASONABLE_SEP = 0.40   # 40 cm
 
 
 
@@ -489,17 +578,24 @@ class TurnCalibrator(Node):
         use_lidar: bool,
         real_imu: bool,
         fusion_mode: str,
+        safety_cutoff_rad: float | None = None,
     ) -> tuple[float, str]:
         """
         Execute one rotation and return (measured_angle_rad, detail_string).
 
+        When a real IMU is available the rotation is **closed-loop**: the
+        motors are stopped as soon as the IMU shows the target angle has
+        been reached, rather than running for a fixed duration.  This
+        eliminates overshoot from dead-zone compensation / motor non-linearity.
+
         Pipeline:
           1. Capture pre-rotation scan (if LiDAR enabled).
-          2. Rotate while accumulating IMU yaw.
+          2. Rotate (closed-loop on IMU, or fixed-duration fallback).
           3. Capture post-rotation scan.
           4. FFT polar cross-correlation → coarse angle.
           5. SVD Procrustes refinement with FFT seed → fine angle.
-          6. Kalman-style weighted fusion with IMU.
+          6. Detect 360° LiDAR aliasing (complement ambiguity).
+          7. Kalman-style weighted fusion with IMU.
         """
         imu_angle: Optional[float] = None
         fft_angle: Optional[float] = None
@@ -516,16 +612,47 @@ class TurnCalibrator(Node):
                 use_lidar = False
 
         # Execute rotation + collect IMU
+        # ---------- closed-loop (IMU-guided) rotation ----------
+        # Instead of running motors for a fixed time, we monitor the IMU
+        # and stop when the accumulated rotation reaches the target.  This
+        # completely eliminates overshoot from dead-zone compensation.
+        #
+        # Fallback to timed open-loop if there is no real IMU.
         duration = abs(target_rad / speed)
+        max_duration = duration * 3.0    # hard time limit even in closed-loop
         self.cum_yaw  = 0.0
         self._last_imu_stamp = None   # reset so first dt is skipped, not garbage
         self.collecting = real_imu
-        end = time.time() + duration
+        safety_triggered = False
+        closed_loop_stop = False
+        start_t = time.time()
+        end = start_t + (max_duration if real_imu else duration)
         while time.time() < end:
             self.send(0.0, speed)
-            rclpy.spin_once(self, timeout_sec=0.05)
+            rclpy.spin_once(self, timeout_sec=0.02)
+
+            if real_imu:
+                # Closed-loop: stop as soon as IMU reaches the target
+                if abs(self.cum_yaw) >= abs(target_rad):
+                    closed_loop_stop = True
+                    break
+                # Safety cutoff
+                if (safety_cutoff_rad is not None
+                        and abs(self.cum_yaw) >= safety_cutoff_rad):
+                    safety_triggered = True
+                    break
         self.collecting = False
         self.stop(settle=0.6)
+        elapsed = time.time() - start_t
+        if closed_loop_stop:
+            print(f"  IMU stop : reached {math.degrees(abs(self.cum_yaw)):.1f}° "
+                  f"in {elapsed:.1f}s (target {math.degrees(abs(target_rad)):.0f}°)")
+        elif safety_triggered:
+            print(f"  Safety   : IMU saw {math.degrees(abs(self.cum_yaw)):.1f}° "
+                  f"(limit {math.degrees(safety_cutoff_rad):.0f}°) — stopped early")
+        elif real_imu:
+            print(f"  Timeout  : {elapsed:.1f}s elapsed, IMU only at "
+                  f"{math.degrees(abs(self.cum_yaw)):.1f}° — motors may be stalling")
 
         if real_imu:
             imu_angle = self.cum_yaw  # signed
@@ -571,6 +698,29 @@ class TurnCalibrator(Node):
                               f"{diff_deg:.1f}° — dropping SVD for this run.")
                         svd_angle = None
 
+                # ── 360° LiDAR aliasing detection ────────────────────────
+                # A 360° FOV scan has a rotation ambiguity: θ and (360°−θ)
+                # produce identical scan alignments.  FFT picks the one
+                # with the smaller shift.  If the IMU is available, check
+                # whether the *complement* (2π − |fft|) is closer to the
+                # IMU reading.  If so, the LiDAR result is aliased and we
+                # correct it.
+                if imu_angle is not None and fft_angle is not None:
+                    fov_rad = scan_before.angle_max - scan_before.angle_min
+                    if fov_rad > math.radians(350):  # only for ~360° LiDARs
+                        lidar_abs = abs(fft_angle)
+                        complement = 2 * math.pi - lidar_abs
+                        imu_abs = abs(imu_angle)
+                        err_direct     = abs(lidar_abs - imu_abs)
+                        err_complement = abs(complement - imu_abs)
+                        if err_complement < err_direct:
+                            print(f"  Aliasing : LiDAR {math.degrees(lidar_abs):.1f}° "
+                                  f"→ complement {math.degrees(complement):.1f}° "
+                                  f"(closer to IMU {math.degrees(imu_abs):.1f}°)")
+                            fft_angle = math.copysign(complement, sign)
+                            # SVD was seeded with the aliased FFT, so discard
+                            svd_angle = None
+
         # Weighted fusion
         fused, detail = fuse_estimates(
             imu_angle, fft_angle, fft_quality, svd_angle, svd_inlier, mode=fusion_mode
@@ -593,7 +743,7 @@ def main():
     parser.add_argument("--apply",  action="store_true",
                         help="write updated WHEEL_SEPARATION to firmware and yaml")
     parser.add_argument("--flash",  action="store_true",
-                        help="after --apply, rebuild/flash firmware and restart service")
+                        help="deprecated: kept for compatibility; runtime calibration no longer reflashes")
     parser.add_argument("--no-lidar", action="store_true",
                         help="skip LiDAR scan-matching; use IMU only")
     parser.add_argument("--scan-topic", default="/scan", metavar="TOPIC",
@@ -607,11 +757,17 @@ def main():
                         help="reset WHEEL_SEPARATION to CM without running a test "
                              "(e.g. --reset 16.0 for the stock Burger default); "
                              "combine with --apply to write immediately")
+    parser.add_argument("--dxl-port", default="/dev/ttyTB3", metavar="PORT",
+                        help="Dynamixel serial port for runtime calibration (default: /dev/ttyTB3)")
+    parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES,
+                        metavar="N",
+                        help="per-run retry limit for outlier runs where a motor "
+                             "stalled or the robot over-rotated "
+                             f"(default: {DEFAULT_MAX_RETRIES})")
     args = parser.parse_args()
 
-    if args.flash and not args.apply:
-        print("ERROR: --flash requires --apply")
-        return 4
+    if args.flash:
+        print("NOTE: --flash is deprecated. Runtime calibration is applied live; no reflashing needed.")
 
     # ── Hard reset: bypass measurement entirely ───────────────────────────────
     if args.reset is not None:
@@ -620,14 +776,24 @@ def main():
         print(f"\nResetting WHEEL_SEPARATION to {new_sep*100:.4f} cm ({new_sep:.6f} m)")
         if args.apply:
             write_define_float(
-                MAIN_C, "WHEEL_SEPARATION", new_sep,
+                MAIN_C, "WHEEL_SEPARATION_DEFAULT", new_sep,
                 "metres — reset by auto_calibrate_imu_turn.py --reset"
             )
             write_yaml_separation(YAML_PATH, new_sep)
+            try:
+                send_calib_command(
+                    port=args.dxl_port,
+                    subcmd=CALIB_CMD_SET,
+                    key=CALIB_KEY_WHEEL_SEPARATION,
+                    value=new_sep,
+                )
+                send_calib_command(port=args.dxl_port, subcmd=CALIB_CMD_SAVE)
+                print("Persisted       : runtime reset saved to firmware flash")
+            except Exception as e:
+                print(f"Warning         : runtime reset/persist failed ({e})")
             print(f"Applied to      : {MAIN_C.relative_to(SCRIPT_DIR)}")
             print(f"Applied to      : {YAML_PATH.relative_to(SCRIPT_DIR)}")
-            print("\nNext steps: rebuild/flash firmware, then restart service:")
-            print(f"  cd {SCRIPT_DIR.relative_to(SCRIPT_DIR.parent)}/firmware && ./build.sh flash")
+            print("\nDone            : reset applied live and persisted; no firmware reflash required")
         else:
             print("Dry-run: use --apply to write.")
         return 0
@@ -640,10 +806,24 @@ def main():
 
     target_rad = math.radians(args.angle)
 
-    old_sep = read_define_float(MAIN_C, "WHEEL_SEPARATION")
+    old_sep = read_define_float(MAIN_C, "WHEEL_SEPARATION_DEFAULT")
     if old_sep is None:
-        print(f"ERROR: WHEEL_SEPARATION not found in {MAIN_C}")
+        print(f"ERROR: WHEEL_SEPARATION_DEFAULT not found in {MAIN_C}")
         return 2
+
+    runtime_sep = old_sep
+
+    # ── Sanity-check current WHEEL_SEPARATION ─────────────────────────────
+    if old_sep < MIN_REASONABLE_SEP:
+        print(f"\nWARNING: WHEEL_SEPARATION = {old_sep*100:.2f} cm is suspiciously low "
+              f"(< {MIN_REASONABLE_SEP*100:.0f} cm).")
+        print("  This usually means a prior calibration diverged.  Consider:")
+        print(f"    ./auto_calibrate_imu_turn.py --reset <actual_cm> --apply")
+        print(f"  (e.g. --reset 13.5 for a 13.5 cm wheel-to-wheel chassis)\n")
+    elif old_sep > MAX_REASONABLE_SEP:
+        print(f"\nWARNING: WHEEL_SEPARATION = {old_sep*100:.2f} cm is suspiciously high "
+              f"(> {MAX_REASONABLE_SEP*100:.0f} cm).")
+        print("  Consider --reset <actual_cm> --apply before calibrating.\n")
 
     print("\n=== Angular Calibration via WHEEL_SEPARATION ===")
     print(f"Firmware        : {MAIN_C}")
@@ -689,24 +869,132 @@ def main():
         print("LiDAR unavailable — switching fusion mode to 'imu'.\n")
 
     measurements: list[float] = []
+    sep_history: list[float] = [runtime_sep]
+
+    # Read motor kick/min-duty defaults from the source so we can restore later
+    orig_kick_cycles = read_define_float(MAIN_C, "MOTOR_KICK_CYCLES_DEFAULT")
+    orig_min_duty    = read_define_float(MAIN_C, "MOTOR_MIN_DUTY_DEFAULT")
 
     if real_imu or use_lidar:
+        # ── Temporarily soften motor parameters for calibration turns ─────
+        # Suppress kick-start burst — it adds uncontrolled angular impulse
+        # at the start of each turn, increasing measurement variance.
+        # Also lower MOTOR_MIN_DUTY slightly to reduce the dead-zone floor
+        # (but keep enough to overcome static friction).
+        calib_min_duty = min(0.40, orig_min_duty) if orig_min_duty else 0.0
+        try:
+            send_calib_command(args.dxl_port, CALIB_CMD_SET,
+                               CALIB_KEY_MOTOR_KICK_CYCLES, value=0.0)
+            send_calib_command(args.dxl_port, CALIB_CMD_SET,
+                               CALIB_KEY_MOTOR_MIN_DUTY, value=calib_min_duty)
+            print(f"Motor prep      : KICK_CYCLES=0, MIN_DUTY={calib_min_duty:.2f} "
+                  f"(was {orig_min_duty:.2f})")
+        except Exception as e:
+            print(f"Warning         : motor prep failed ({e})")
+
+        # IMU safety cutoff for this target
+        safety_cutoff = target_rad * IMU_SAFETY_CUTOFF_RATIO
+
         # ── Automatic measurement (IMU and/or LiDAR) ─────────────────────
+        discarded_runs = 0
+        effective_speed = args.speed
         for i in range(args.runs):
-            print(f"Run {i+1}/{args.runs} — rotating {args.angle:.0f} deg ...")
-            measured, detail = node.measure_rotation_fused(
-                speed=args.speed,
-                target_rad=target_rad,
-                use_lidar=use_lidar,
-                real_imu=real_imu,
-                fusion_mode=fusion_mode,
-            )
-            measurements.append(abs(measured))
-            print(f"  Measured : {math.degrees(abs(measured)):.2f}°  "
-                  f"desired={args.angle:.1f}°  ratio={target_rad/abs(measured):.4f}")
-            print(f"  Detail   : {detail}")
+            accepted = False
+            for attempt in range(1, args.max_retries + 1):
+                suffix = f" (attempt {attempt})" if attempt > 1 else ""
+                print(f"Run {i+1}/{args.runs}{suffix} — rotating {args.angle:.0f} deg "
+                      f"at {effective_speed:.2f} rad/s ...")
+                measured, detail = node.measure_rotation_fused(
+                    speed=effective_speed,
+                    target_rad=target_rad,
+                    use_lidar=use_lidar,
+                    real_imu=real_imu,
+                    fusion_mode=fusion_mode,
+                    safety_cutoff_rad=safety_cutoff if real_imu else None,
+                )
+                abs_measured = abs(measured)
+                ratio = abs_measured / target_rad if target_rad > 0 else 0.0
+
+                # ── outlier detection ─────────────────────────────────────
+                if ratio < MIN_ANGLE_RATIO:
+                    print(f"  OUTLIER  : measured {math.degrees(abs_measured):.1f}° "
+                          f"is only {ratio:.0%} of target "
+                          f"({args.angle:.0f}°) — motor may not have moved")
+                    if attempt < args.max_retries:
+                        print("           : retrying after short pause...")
+                        node.stop(1.5)
+                        time.sleep(1.0)
+                        continue
+                    else:
+                        print("           : max retries reached, skipping run")
+                        break
+
+                if ratio > MAX_ANGLE_RATIO:
+                    print(f"  OUTLIER  : measured {math.degrees(abs_measured):.1f}° "
+                          f"is {ratio:.0%} of target "
+                          f"({args.angle:.0f}°) — rotation overshot")
+                    # Reduce speed for the next attempt/run to lessen overshoot
+                    effective_speed = max(0.10, effective_speed * 0.6)
+                    print(f"           : reducing speed to {effective_speed:.2f} rad/s")
+                    if attempt < args.max_retries:
+                        print("           : retrying after short pause...")
+                        node.stop(1.5)
+                        time.sleep(1.0)
+                        continue
+                    else:
+                        print("           : max retries reached, skipping run")
+                        break
+
+                # ── valid measurement ─────────────────────────────────────
+                accepted = True
+                measurements.append(abs_measured)
+                print(f"  Measured : {math.degrees(abs_measured):.2f}°  "
+                      f"desired={args.angle:.1f}°  ratio={target_rad/abs_measured:.4f}")
+                print(f"  Detail   : {detail}")
+
+                # Iterative runtime update for the next run.
+                # Clamp raw correction to avoid divergent leaps from one bad
+                # measurement (e.g. 10° measured → 18× multiplier).
+                correction = target_rad / abs_measured
+                correction = max(1.0 - MAX_CORRECTION_PER_STEP,
+                                 min(1.0 + MAX_CORRECTION_PER_STEP, correction))
+                correction_damped = 1.0 + args.damping * (correction - 1.0)
+                next_sep = max(0.01, min(0.50, runtime_sep * correction_damped))
+                try:
+                    send_calib_command(
+                        port=args.dxl_port,
+                        subcmd=CALIB_CMD_SET,
+                        key=CALIB_KEY_WHEEL_SEPARATION,
+                        value=next_sep,
+                    )
+                    runtime_sep = next_sep
+                    sep_history.append(runtime_sep)
+                    print(f"  Runtime  : WHEEL_SEPARATION={runtime_sep:.6f} m applied to firmware")
+                except Exception as e:
+                    print(f"  Warning  : runtime calibration update failed ({e})")
+                break   # accepted — exit retry loop
+
+            if not accepted:
+                discarded_runs += 1
             if i < args.runs - 1:
                 time.sleep(0.8)
+
+        if discarded_runs:
+            print(f"\nNote: {discarded_runs} run(s) discarded as outliers.")
+
+        # ── Restore original motor parameters ─────────────────────────────
+        try:
+            if orig_kick_cycles is not None:
+                send_calib_command(args.dxl_port, CALIB_CMD_SET,
+                                   CALIB_KEY_MOTOR_KICK_CYCLES,
+                                   value=float(orig_kick_cycles))
+            if orig_min_duty is not None:
+                send_calib_command(args.dxl_port, CALIB_CMD_SET,
+                                   CALIB_KEY_MOTOR_MIN_DUTY,
+                                   value=float(orig_min_duty))
+            print("Motor restore   : KICK_CYCLES and MIN_DUTY back to defaults")
+        except Exception as e:
+            print(f"Warning         : motor restore failed ({e})")
     else:
         # ── Manual measurement fallback ───────────────────────────────────
         print("WARNING: Simulated IMU and no LiDAR — using manual measurement mode.")
@@ -752,15 +1040,8 @@ def main():
         if len(measurements) > 1 else float("nan")
     )
 
-    # new_sep = old_sep * (1 + damping*(correction - 1))
-    # where correction = target/measured
-    # This damps the step: at damping=1.0 it applies the full correction;
-    # at damping=0.85 it applies 85% of the step, preventing divergence
-    # caused by noisy single-session measurements.
-    correction = target_rad / avg_measured
-    correction_damped = 1.0 + args.damping * (correction - 1.0)
-    new_sep = old_sep * correction_damped
-    new_sep = max(0.01, min(0.50, new_sep))   # sanity clamp 1-50 cm
+    # Runtime iterative calibration already applied each run; final value is runtime_sep.
+    new_sep = runtime_sep
 
     # Warn if run-to-run variance is high enough that the result may be
     # unreliable (σ > 20% of mean)
@@ -775,37 +1056,23 @@ def main():
     print(f"Desired         : {args.angle:.1f}°")
     print(f"old WHEEL_SEP   : {old_sep*100:.4f} cm  ({old_sep:.6f} m)")
     print(f"new WHEEL_SEP   : {new_sep*100:.4f} cm  ({new_sep:.6f} m)")
-    print(f"Formula         : new = {old_sep:.6f} × (1 + {args.damping:.2f}×({args.angle:.1f}°/{math.degrees(avg_measured):.2f}°-1))")
+    print(f"Runtime updates : {len(sep_history)-1} iterative step(s)")
+    print(f"Formula/step    : sep := sep × (1 + {args.damping:.2f}×(desired/measured-1))")
 
     if args.apply:
         write_define_float(
-            MAIN_C, "WHEEL_SEPARATION", new_sep,
+            MAIN_C, "WHEEL_SEPARATION_DEFAULT", new_sep,
             "metres — effective turning base; calibrated by auto_calibrate_imu_turn.py"
         )
         write_yaml_separation(YAML_PATH, new_sep)
+        try:
+            send_calib_command(args.dxl_port, CALIB_CMD_SAVE)
+            print("Persisted       : runtime calibration saved to firmware flash")
+        except Exception as e:
+            print(f"Warning         : could not save runtime calibration to flash ({e})")
         print(f"\nApplied to      : {MAIN_C.relative_to(SCRIPT_DIR)}")
         print(f"Applied to      : {YAML_PATH.relative_to(SCRIPT_DIR)}")
-
-        if args.flash:
-            print("\n--- Flash ----------------------------------------------------")
-            if not BUILD_SCRIPT.exists():
-                print(f"ERROR: {BUILD_SCRIPT} not found")
-                return 5
-            print("Building and flashing firmware...")
-            r = subprocess.run(["bash", str(BUILD_SCRIPT), "flash"],
-                               cwd=str(FIRMWARE_DIR))
-            if r.returncode != 0:
-                print(f"ERROR: flash failed (exit {r.returncode})")
-                return r.returncode
-            print("Restarting turtlebot3-bringup service...")
-            r = subprocess.run(["sudo", "systemctl", "restart", "turtlebot3-bringup"])
-            if r.returncode != 0:
-                print(f"ERROR: service restart failed (exit {r.returncode})")
-                return r.returncode
-            print("Done — firmware flashed and service restarted.")
-        else:
-            print("\nNext steps: rebuild/flash firmware, then restart service:")
-            print(f"  cd firmware && ./build.sh flash")
+        print("\nDone            : calibration applied live and persisted; no firmware reflash required")
     else:
         print("\nDry-run: no files changed. Use --apply to write changes.")
 

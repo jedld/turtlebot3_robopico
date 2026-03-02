@@ -41,6 +41,8 @@
 #include "hardware/pwm.h"
 #include "hardware/adc.h"
 #include "hardware/i2c.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
 #include "hardware/watchdog.h"
 #include "pico/bootrom.h"
 #include "bsp/board.h"
@@ -98,13 +100,13 @@
 //   turtlebot3_bringup/param/humble/burger.yaml
 // ============================================================
 
-#define WHEEL_RADIUS        0.361910f  // metres — calibrated (723.8 mm diam. effective)
+#define WHEEL_RADIUS_DEFAULT        0.361910f  // metres — calibrated (723.8 mm diam. effective)
 // ANGULAR CALIBRATION: do NOT use a scale factor (it breaks odometry).
 // Tune WHEEL_SEPARATION to match effective turning base; run auto_calibrate_imu_turn.py.
-#define WHEEL_SEPARATION    0.074968f  // metres — effective turning base; calibrated by auto_calibrate_imu_turn.py
-#define MAX_WHEEL_SPEED_MS  2.000000f  // calibrated — straight_calibrate.py
-#define RIGHT_MOTOR_REVERSED 0       // set to 1 if right wheel spins backward
-#define SWAP_LEFT_RIGHT_MOTORS 1      // set to 1 if M1/M2 are physically wired to opposite sides
+#define WHEEL_SEPARATION_DEFAULT    0.224042f  // metres — effective turning base; calibrated by auto_calibrate_imu_turn.py
+#define MAX_WHEEL_SPEED_MS_DEFAULT  2.000000f  // calibrated — straight_calibrate.py
+#define RIGHT_MOTOR_REVERSED_DEFAULT 0       // set to 1 if right wheel spins backward
+#define SWAP_LEFT_RIGHT_MOTORS_DEFAULT 1      // set to 1 if M1/M2 are physically wired to opposite sides
 
 // Minimum duty cycle (dead-zone compensation).
 // TT DC Dual Metal Gearbox Motor (1:90) — higher gear ratio means more
@@ -112,28 +114,158 @@
 // Any non-zero throttle is boosted to at least this value.
 // Set to 0.0f to disable.  Range: 0.0 – 1.0.
 // Re-run straight_calibrate.py if motors stall or overshoot.
-#define MOTOR_MIN_DUTY      0.55f
+#define MOTOR_MIN_DUTY_DEFAULT      0.28f  // calibrated — calibrate_deadzone.py
 
 // Kick-start: when a motor transitions from stopped to moving (or reverses
 // direction), apply KICK_DUTY for KICK_CYCLES odometry cycles to overcome
 // static friction, then settle to normal (dead-zone compensated) duty.
 // Particularly important for pivot turns where individual wheel velocities
 // are very small.  Set KICK_CYCLES to 0 to disable.
-#define MOTOR_KICK_DUTY     0.60f   // 60% duty for the kick pulse
-#define MOTOR_KICK_CYCLES   3u      // 3 × 20 ms = 60 ms burst
+#define MOTOR_KICK_DUTY_DEFAULT     0.33f  // calibrated — calibrate_deadzone.py
+#define MOTOR_KICK_CYCLES_DEFAULT   3u  // calibrated — calibrate_deadzone.py
 
 // Per-motor throttle trim — compensates for manufacturing differences between
 // the left and right motors that cause the robot to drift sideways.
 // Range: 0.80 – 1.20.  Keep the faster motor at 1.0 and reduce the other.
 // These are computed automatically by turtlebot3_pico/straight_calibrate.py.
-#define MOTOR_TRIM_LEFT    1.000000f  // calibrated — straight_calibrate.py
-#define MOTOR_TRIM_RIGHT   0.700000f  // calibrated — straight_calibrate.py
-#define RPM_TO_MS   (0.229f * 0.0034557519189487725f)
-#define RPM_PER_MS  (1.0f / RPM_TO_MS)
+#define MOTOR_TRIM_LEFT_DEFAULT    1.000000f  // calibrated — straight_calibrate.py
+#define MOTOR_TRIM_RIGHT_DEFAULT   0.700000f  // calibrated — straight_calibrate.py
 
 // Dynamixel position tick: ~0.001534 rad/tick (4096 ticks/rev)
 #define TICK_TO_RAD     0.001533981f
 #define TICKS_PER_RAD   (1.0f / TICK_TO_RAD)
+
+static float cfg_wheel_radius = WHEEL_RADIUS_DEFAULT;
+static float cfg_wheel_separation = WHEEL_SEPARATION_DEFAULT;
+static float cfg_max_wheel_speed_ms = MAX_WHEEL_SPEED_MS_DEFAULT;
+static uint8_t cfg_right_motor_reversed = RIGHT_MOTOR_REVERSED_DEFAULT;
+static uint8_t cfg_swap_left_right_motors = SWAP_LEFT_RIGHT_MOTORS_DEFAULT;
+static float cfg_motor_min_duty = MOTOR_MIN_DUTY_DEFAULT;
+static float cfg_motor_kick_duty = MOTOR_KICK_DUTY_DEFAULT;
+static uint8_t cfg_motor_kick_cycles = MOTOR_KICK_CYCLES_DEFAULT;
+static float cfg_motor_trim_left = MOTOR_TRIM_LEFT_DEFAULT;
+static float cfg_motor_trim_right = MOTOR_TRIM_RIGHT_DEFAULT;
+
+static inline float ms_per_rpm(void) {
+    return (2.0f * 3.14159265358979323846f * cfg_wheel_radius) / 60.0f;
+}
+
+static inline float rpm_per_ms(void) {
+    float scale = ms_per_rpm();
+    if (scale <= 0.0f) {
+        return 0.0f;
+    }
+    return 1.0f / scale;
+}
+
+#define CALIB_FLASH_MAGIC   0x43414C31u  // "CAL1"
+#define CALIB_FLASH_VERSION 1u
+#define CALIB_FLASH_OFFSET  (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size;
+    float wheel_radius;
+    float wheel_separation;
+    float max_wheel_speed_ms;
+    float motor_min_duty;
+    float motor_kick_duty;
+    uint8_t motor_kick_cycles;
+    uint8_t right_motor_reversed;
+    uint8_t swap_left_right_motors;
+    uint8_t reserved0;
+    float motor_trim_left;
+    float motor_trim_right;
+    uint32_t checksum;
+} calib_flash_t;
+
+static uint32_t fnv1a32(const uint8_t *data, uint32_t len) {
+    uint32_t hash = 2166136261u;
+    for (uint32_t i = 0; i < len; i++) {
+        hash ^= data[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static void fill_calib_blob(calib_flash_t *blob) {
+    memset(blob, 0, sizeof(*blob));
+    blob->magic = CALIB_FLASH_MAGIC;
+    blob->version = CALIB_FLASH_VERSION;
+    blob->size = (uint16_t)sizeof(calib_flash_t);
+    blob->wheel_radius = cfg_wheel_radius;
+    blob->wheel_separation = cfg_wheel_separation;
+    blob->max_wheel_speed_ms = cfg_max_wheel_speed_ms;
+    blob->motor_min_duty = cfg_motor_min_duty;
+    blob->motor_kick_duty = cfg_motor_kick_duty;
+    blob->motor_kick_cycles = cfg_motor_kick_cycles;
+    blob->right_motor_reversed = cfg_right_motor_reversed;
+    blob->swap_left_right_motors = cfg_swap_left_right_motors;
+    blob->motor_trim_left = cfg_motor_trim_left;
+    blob->motor_trim_right = cfg_motor_trim_right;
+    blob->checksum = fnv1a32((const uint8_t *)blob, (uint32_t)(sizeof(calib_flash_t) - sizeof(uint32_t)));
+}
+
+static bool is_calib_blob_valid(const calib_flash_t *blob) {
+    if (blob->magic != CALIB_FLASH_MAGIC) return false;
+    if (blob->version != CALIB_FLASH_VERSION) return false;
+    if (blob->size != sizeof(calib_flash_t)) return false;
+    uint32_t expect = fnv1a32((const uint8_t *)blob, (uint32_t)(sizeof(calib_flash_t) - sizeof(uint32_t)));
+    if (blob->checksum != expect) return false;
+
+    if (blob->wheel_radius < 0.01f || blob->wheel_radius > 1.0f) return false;
+    if (blob->wheel_separation < 0.01f || blob->wheel_separation > 1.0f) return false;
+    if (blob->max_wheel_speed_ms < 0.01f || blob->max_wheel_speed_ms > 5.0f) return false;
+    if (blob->motor_min_duty < 0.0f || blob->motor_min_duty > 1.0f) return false;
+    if (blob->motor_kick_duty < 0.0f || blob->motor_kick_duty > 1.0f) return false;
+    if (blob->motor_kick_cycles > 20u) return false;
+    if (blob->motor_trim_left < 0.5f || blob->motor_trim_left > 1.5f) return false;
+    if (blob->motor_trim_right < 0.5f || blob->motor_trim_right > 1.5f) return false;
+    return true;
+}
+
+static void apply_calib_blob(const calib_flash_t *blob) {
+    cfg_wheel_radius = blob->wheel_radius;
+    cfg_wheel_separation = blob->wheel_separation;
+    cfg_max_wheel_speed_ms = blob->max_wheel_speed_ms;
+    cfg_motor_min_duty = blob->motor_min_duty;
+    cfg_motor_kick_duty = blob->motor_kick_duty;
+    cfg_motor_kick_cycles = blob->motor_kick_cycles;
+    cfg_right_motor_reversed = blob->right_motor_reversed ? 1u : 0u;
+    cfg_swap_left_right_motors = blob->swap_left_right_motors ? 1u : 0u;
+    cfg_motor_trim_left = blob->motor_trim_left;
+    cfg_motor_trim_right = blob->motor_trim_right;
+}
+
+static bool save_calibration_to_flash(void) {
+    calib_flash_t blob;
+    fill_calib_blob(&blob);
+
+    uint8_t page[FLASH_PAGE_SIZE];
+    memset(page, 0xFF, sizeof(page));
+    memcpy(page, &blob, sizeof(blob));
+
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase(CALIB_FLASH_OFFSET, FLASH_SECTOR_SIZE);
+    flash_range_program(CALIB_FLASH_OFFSET, page, FLASH_PAGE_SIZE);
+    restore_interrupts(ints);
+
+    const calib_flash_t *stored = (const calib_flash_t *)(0x10000000u + CALIB_FLASH_OFFSET);
+    if (!is_calib_blob_valid(stored)) {
+        return false;
+    }
+    return true;
+}
+
+static bool load_calibration_from_flash(void) {
+    const calib_flash_t *stored = (const calib_flash_t *)(0x10000000u + CALIB_FLASH_OFFSET);
+    if (!is_calib_blob_valid(stored)) {
+        return false;
+    }
+    apply_calib_blob(stored);
+    return true;
+}
 
 // Simulated IMU: gravity on Z axis (robot is flat)
 #define IMU_GRAVITY_Z   9.81f
@@ -408,6 +540,155 @@ static uint32_t build_status(uint8_t dev_id, uint8_t error,
 static volatile uint64_t last_cmd_vel_us    = 0;
 static volatile uint64_t last_host_comm_us  = 0;
 
+#define INST_CALIBRATION 0x90u
+#define CALIB_CMD_SET    0x01u
+#define CALIB_CMD_GET    0x02u
+#define CALIB_CMD_RESET  0x03u
+#define CALIB_CMD_SAVE   0x04u
+#define CALIB_CMD_LOAD   0x05u
+#define CALIB_CMD_RESET_AND_SAVE 0x06u
+
+#define CALIB_KEY_WHEEL_RADIUS        0x01u
+#define CALIB_KEY_WHEEL_SEPARATION    0x02u
+#define CALIB_KEY_MAX_WHEEL_SPEED_MS  0x03u
+#define CALIB_KEY_MOTOR_MIN_DUTY      0x04u
+#define CALIB_KEY_MOTOR_KICK_DUTY     0x05u
+#define CALIB_KEY_MOTOR_KICK_CYCLES   0x06u
+#define CALIB_KEY_MOTOR_TRIM_LEFT     0x07u
+#define CALIB_KEY_MOTOR_TRIM_RIGHT    0x08u
+#define CALIB_KEY_RIGHT_MOTOR_REVERSED 0x09u
+#define CALIB_KEY_SWAP_MOTORS         0x0Au
+
+static void send_packet(uint32_t len);
+
+static float read_f32_le(const uint8_t *p) {
+    float v;
+    memcpy(&v, p, sizeof(float));
+    return v;
+}
+
+static void write_f32_le(uint8_t *p, float v) {
+    memcpy(p, &v, sizeof(float));
+}
+
+static bool set_calibration_value(uint8_t key, float value) {
+    switch (key) {
+        case CALIB_KEY_WHEEL_RADIUS:
+            if (value < 0.01f || value > 1.0f) return false;
+            cfg_wheel_radius = value;
+            return true;
+        case CALIB_KEY_WHEEL_SEPARATION:
+            if (value < 0.01f || value > 1.0f) return false;
+            cfg_wheel_separation = value;
+            return true;
+        case CALIB_KEY_MAX_WHEEL_SPEED_MS:
+            if (value < 0.01f || value > 5.0f) return false;
+            cfg_max_wheel_speed_ms = value;
+            return true;
+        case CALIB_KEY_MOTOR_MIN_DUTY:
+            if (value < 0.0f || value > 1.0f) return false;
+            cfg_motor_min_duty = value;
+            return true;
+        case CALIB_KEY_MOTOR_KICK_DUTY:
+            if (value < 0.0f || value > 1.0f) return false;
+            cfg_motor_kick_duty = value;
+            return true;
+        case CALIB_KEY_MOTOR_KICK_CYCLES:
+            if (value < 0.0f || value > 20.0f) return false;
+            cfg_motor_kick_cycles = (uint8_t)(value + 0.5f);
+            return true;
+        case CALIB_KEY_MOTOR_TRIM_LEFT:
+            if (value < 0.5f || value > 1.5f) return false;
+            cfg_motor_trim_left = value;
+            return true;
+        case CALIB_KEY_MOTOR_TRIM_RIGHT:
+            if (value < 0.5f || value > 1.5f) return false;
+            cfg_motor_trim_right = value;
+            return true;
+        case CALIB_KEY_RIGHT_MOTOR_REVERSED:
+            cfg_right_motor_reversed = (value >= 0.5f) ? 1u : 0u;
+            return true;
+        case CALIB_KEY_SWAP_MOTORS:
+            cfg_swap_left_right_motors = (value >= 0.5f) ? 1u : 0u;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void reset_calibration_defaults(void) {
+    cfg_wheel_radius = WHEEL_RADIUS_DEFAULT;
+    cfg_wheel_separation = WHEEL_SEPARATION_DEFAULT;
+    cfg_max_wheel_speed_ms = MAX_WHEEL_SPEED_MS_DEFAULT;
+    cfg_right_motor_reversed = RIGHT_MOTOR_REVERSED_DEFAULT;
+    cfg_swap_left_right_motors = SWAP_LEFT_RIGHT_MOTORS_DEFAULT;
+    cfg_motor_min_duty = MOTOR_MIN_DUTY_DEFAULT;
+    cfg_motor_kick_duty = MOTOR_KICK_DUTY_DEFAULT;
+    cfg_motor_kick_cycles = MOTOR_KICK_CYCLES_DEFAULT;
+    cfg_motor_trim_left = MOTOR_TRIM_LEFT_DEFAULT;
+    cfg_motor_trim_right = MOTOR_TRIM_RIGHT_DEFAULT;
+}
+
+static void handle_calibration(uint8_t dev_id, const uint8_t *params, uint16_t nparams,
+                               bool send_reply) {
+    if (nparams < 1u) {
+        if (send_reply) {
+            uint32_t len = build_status(dev_id, 0x02, NULL, 0);
+            send_packet(len);
+        }
+        return;
+    }
+
+    uint8_t subcmd = params[0];
+    uint8_t out[40];
+    uint16_t out_len = 0;
+    bool ok = true;
+
+    if (subcmd == CALIB_CMD_SET) {
+        if (nparams < 6u) {
+            ok = false;
+        } else {
+            uint8_t key = params[1];
+            float value = read_f32_le(&params[2]);
+            ok = set_calibration_value(key, value);
+        }
+    } else if (subcmd == CALIB_CMD_GET) {
+        out[0] = CALIB_CMD_GET;
+        write_f32_le(&out[1],  cfg_wheel_radius);
+        write_f32_le(&out[5],  cfg_wheel_separation);
+        write_f32_le(&out[9],  cfg_max_wheel_speed_ms);
+        out[13] = cfg_right_motor_reversed;
+        out[14] = cfg_swap_left_right_motors;
+        write_f32_le(&out[15], cfg_motor_min_duty);
+        write_f32_le(&out[19], cfg_motor_kick_duty);
+        out[23] = cfg_motor_kick_cycles;
+        write_f32_le(&out[24], cfg_motor_trim_left);
+        write_f32_le(&out[28], cfg_motor_trim_right);
+        out_len = 32u;
+    } else if (subcmd == CALIB_CMD_RESET) {
+        reset_calibration_defaults();
+    } else if (subcmd == CALIB_CMD_SAVE) {
+        ok = save_calibration_to_flash();
+    } else if (subcmd == CALIB_CMD_LOAD) {
+        ok = load_calibration_from_flash();
+    } else if (subcmd == CALIB_CMD_RESET_AND_SAVE) {
+        reset_calibration_defaults();
+        ok = save_calibration_to_flash();
+    } else {
+        ok = false;
+    }
+
+    if (send_reply) {
+        if (!ok) {
+            uint32_t len = build_status(dev_id, 0x03, NULL, 0);
+            send_packet(len);
+        } else {
+            uint32_t len = build_status(dev_id, 0x00, out_len ? out : NULL, out_len);
+            send_packet(len);
+        }
+    }
+}
+
 // ============================================================
 // DYNAMIXEL PROTOCOL 2.0  —  INSTRUCTION HANDLERS
 // ============================================================
@@ -609,6 +890,9 @@ static void dispatch_packet(void) {
         case 0x08:  // REBOOT
             if (send_reply) handle_reboot(dev_id);
             break;
+        case INST_CALIBRATION:
+            handle_calibration(dev_id, params, nparams, send_reply);
+            break;
         default:
             break;  // unknown instruction — ignore
     }
@@ -710,7 +994,7 @@ static void set_motor(uint slice, bool reversed, float throttle, int motor_idx) 
 
     // Detect start-from-rest or direction change → trigger kick
     if (new_dir != 0 && new_dir != ms->dir) {
-        ms->kick_remaining = MOTOR_KICK_CYCLES;
+        ms->kick_remaining = cfg_motor_kick_cycles;
     }
     ms->dir = new_dir;
 
@@ -718,15 +1002,15 @@ static void set_motor(uint slice, bool reversed, float throttle, int motor_idx) 
     // duty needed to overcome the motor's static friction.  This maps the
     // input range [0.001, 1.0] → [MOTOR_MIN_DUTY, 1.0] linearly.
     float mag = fabsf(throttle);
-    if (mag > 0.001f && MOTOR_MIN_DUTY > 0.0f) {
-        mag = MOTOR_MIN_DUTY + mag * (1.0f - MOTOR_MIN_DUTY);
+    if (mag > 0.001f && cfg_motor_min_duty > 0.0f) {
+        mag = cfg_motor_min_duty + mag * (1.0f - cfg_motor_min_duty);
         if (mag > 1.0f) mag = 1.0f;
     }
 
     // Kick-start: override duty during the kick window
     if (ms->kick_remaining > 0 && mag > 0.001f) {
-        if (mag < MOTOR_KICK_DUTY) {
-            mag = MOTOR_KICK_DUTY;
+        if (mag < cfg_motor_kick_duty) {
+            mag = cfg_motor_kick_duty;
         }
         ms->kick_remaining--;
     }
@@ -1431,20 +1715,20 @@ static void update_odometry(float dt) {
         // else: no velocity written yet, or host timed out → lin_x/ang_z stay 0
     }
 
-    float v_left  = lin_x - ang_z * (WHEEL_SEPARATION / 2.0f);
-    float v_right = lin_x + ang_z * (WHEEL_SEPARATION / 2.0f);
+    float v_left  = lin_x - ang_z * (cfg_wheel_separation / 2.0f);
+    float v_right = lin_x + ang_z * (cfg_wheel_separation / 2.0f);
 
     // Drive motors — apply per-motor trim before dead-zone/kick logic
     float thr_l = 0.0f, thr_r = 0.0f;
     if (torque_on) {
-        thr_l = (v_left  / MAX_WHEEL_SPEED_MS) * MOTOR_TRIM_LEFT;
-        thr_r = (v_right / MAX_WHEEL_SPEED_MS) * MOTOR_TRIM_RIGHT;
-        if (SWAP_LEFT_RIGHT_MOTORS) {
-            set_motor(pwm_slice_m1, RIGHT_MOTOR_REVERSED, thr_r, 1);
+        thr_l = (v_left  / cfg_max_wheel_speed_ms) * cfg_motor_trim_left;
+        thr_r = (v_right / cfg_max_wheel_speed_ms) * cfg_motor_trim_right;
+        if (cfg_swap_left_right_motors) {
+            set_motor(pwm_slice_m1, cfg_right_motor_reversed != 0u, thr_r, 1);
             set_motor(pwm_slice_m2, false,               thr_l, 0);
         } else {
             set_motor(pwm_slice_m1, false,               thr_l, 0);
-            set_motor(pwm_slice_m2, RIGHT_MOTOR_REVERSED, thr_r, 1);
+            set_motor(pwm_slice_m2, cfg_right_motor_reversed != 0u, thr_r, 1);
         }
         // LED feedback: on while motors are actively driven
         gpio_put(PIN_LED, (fabsf(thr_l) > 0.001f || fabsf(thr_r) > 0.001f));
@@ -1465,29 +1749,30 @@ static void update_odometry(float dt) {
     float eff_v_left  = 0.0f;
     float eff_v_right = 0.0f;
     if (torque_on) {
-        float raw_l = fabsf(v_left  / MAX_WHEEL_SPEED_MS);
-        float raw_r = fabsf(v_right / MAX_WHEEL_SPEED_MS);
+        float raw_l = fabsf(v_left  / cfg_max_wheel_speed_ms);
+        float raw_r = fabsf(v_right / cfg_max_wheel_speed_ms);
         if (raw_l > 0.001f) {
-            float eff_l = (MOTOR_MIN_DUTY > 0.0f)
-                          ? MOTOR_MIN_DUTY + raw_l * (1.0f - MOTOR_MIN_DUTY)
+            float eff_l = (cfg_motor_min_duty > 0.0f)
+                          ? cfg_motor_min_duty + raw_l * (1.0f - cfg_motor_min_duty)
                           : raw_l;
-            eff_v_left  = (v_left  >= 0.0f ? 1.0f : -1.0f) * eff_l * MAX_WHEEL_SPEED_MS;
+            eff_v_left  = (v_left  >= 0.0f ? 1.0f : -1.0f) * eff_l * cfg_max_wheel_speed_ms;
         }
         if (raw_r > 0.001f) {
-            float eff_r = (MOTOR_MIN_DUTY > 0.0f)
-                          ? MOTOR_MIN_DUTY + raw_r * (1.0f - MOTOR_MIN_DUTY)
+            float eff_r = (cfg_motor_min_duty > 0.0f)
+                          ? cfg_motor_min_duty + raw_r * (1.0f - cfg_motor_min_duty)
                           : raw_r;
-            eff_v_right = (v_right >= 0.0f ? 1.0f : -1.0f) * eff_r * MAX_WHEEL_SPEED_MS;
+            eff_v_right = (v_right >= 0.0f ? 1.0f : -1.0f) * eff_r * cfg_max_wheel_speed_ms;
         }
     }
 
     // Wheel velocities (Dynamixel RPM units) — report effective velocity
-    w_i32(ADDR_PRESENT_VEL_L, (int32_t)(eff_v_left  * RPM_PER_MS));
-    w_i32(ADDR_PRESENT_VEL_R, (int32_t)(eff_v_right * RPM_PER_MS));
+    float vel_scale = rpm_per_ms();
+    w_i32(ADDR_PRESENT_VEL_L, (int32_t)(eff_v_left  * vel_scale));
+    w_i32(ADDR_PRESENT_VEL_R, (int32_t)(eff_v_right * vel_scale));
 
     // Wheel positions (accumulating ticks) — use effective velocity
-    float d_rad_l = (eff_v_left  * dt) / WHEEL_RADIUS;
-    float d_rad_r = (eff_v_right * dt) / WHEEL_RADIUS;
+    float d_rad_l = (eff_v_left  * dt) / cfg_wheel_radius;
+    float d_rad_r = (eff_v_right * dt) / cfg_wheel_radius;
 
     int64_t new_l = (int64_t)pos_left_ticks  + (int64_t)(d_rad_l * TICKS_PER_RAD);
     int64_t new_r = (int64_t)pos_right_ticks + (int64_t)(d_rad_r * TICKS_PER_RAD);
@@ -1652,6 +1937,10 @@ int main(void) {
 
     // Initialise control table registers
     init_registers();
+
+    // Restore persisted runtime calibration if present and valid.
+    // If flash is empty/corrupt, defaults remain active.
+    load_calibration_from_flash();
 
     // Hardware init
     init_motors();

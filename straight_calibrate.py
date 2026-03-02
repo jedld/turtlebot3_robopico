@@ -10,11 +10,12 @@ drift while driving perpendicular to a wall.  Computes corrections for:
   2. MOTOR_TRIM_LEFT / MOTOR_TRIM_RIGHT — per-motor duty to cancel lateral drift
      (measured from IMU yaw + LiDAR wall-plane angle change)
 
-The corrections are written back to:
-  • firmware/main.c  (MAX_WHEEL_SPEED_MS, MOTOR_TRIM_LEFT, MOTOR_TRIM_RIGHT)
-
-After updating, the script rebuilds and reflashes the firmware automatically,
-then runs one more verification pass to confirm calibration.
+The corrections are applied live to firmware runtime each pass via a custom
+Dynamixel calibration instruction, then persisted at the end (no firmware
+reflash required).  Source defaults are also written back to:
+    • firmware/main.c  (MAX_WHEEL_SPEED_MS_DEFAULT,
+                                            MOTOR_TRIM_LEFT_DEFAULT,
+                                            MOTOR_TRIM_RIGHT_DEFAULT)
 
 Safety:
   • Robot stops immediately if front LiDAR < WALL_STOP_M (0.35 m default)
@@ -29,7 +30,7 @@ Options:
   --passes   N    calibration passes to average  (default 3)
     --manual-start  fully manual start position for every pass (no auto-return)
     --imu-only      calibrate straightness from IMU/odometry only (ignore LiDAR metrics)
-  --no-flash      update files but skip rebuild/flash
+    --no-flash      runtime-only session (skip source/flash persistence)
   --verify-only   run one measurement pass, print results, exit (no changes)
 
 Requires: ROS 2 bringup already running with /scan, /imu, /odom topics.
@@ -39,11 +40,13 @@ import argparse
 import math
 import os
 import re
+import struct
 import subprocess
 import sys
 import time
 
 import rclpy
+import serial
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
@@ -63,6 +66,90 @@ SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 FIRMWARE_DIR = os.path.join(SCRIPT_DIR, "firmware")
 MAIN_C       = os.path.join(FIRMWARE_DIR, "main.c")
 YAML_PATH    = os.path.join(SCRIPT_DIR, "config", "burger_pico.yaml")
+
+DEV_ID = 200
+DXL_BAUD = 1_000_000
+INST_CALIBRATION = 0x90
+CALIB_CMD_SET = 0x01
+CALIB_CMD_SAVE = 0x04
+CALIB_CMD_LOAD = 0x05
+CALIB_CMD_RESET = 0x03
+CALIB_CMD_RESET_AND_SAVE = 0x06
+
+CALIB_KEY_WHEEL_RADIUS = 0x01
+CALIB_KEY_WHEEL_SEPARATION = 0x02
+CALIB_KEY_MAX_WHEEL_SPEED_MS = 0x03
+CALIB_KEY_MOTOR_MIN_DUTY = 0x04
+CALIB_KEY_MOTOR_KICK_DUTY = 0x05
+CALIB_KEY_MOTOR_KICK_CYCLES = 0x06
+CALIB_KEY_MOTOR_TRIM_LEFT = 0x07
+CALIB_KEY_MOTOR_TRIM_RIGHT = 0x08
+CALIB_KEY_RIGHT_MOTOR_REVERSED = 0x09
+CALIB_KEY_SWAP_MOTORS = 0x0A
+
+
+def _make_crc_table() -> list[int]:
+    table = []
+    for i in range(256):
+        crc = i << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x8005) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+        table.append(crc)
+    return table
+
+
+_CRC_TABLE = _make_crc_table()
+
+
+def _crc16(data: bytes) -> int:
+    crc = 0
+    for b in data:
+        crc = ((crc << 8) ^ _CRC_TABLE[((crc >> 8) ^ b) & 0xFF]) & 0xFFFF
+    return crc
+
+
+def _build_instruction(dev_id: int, inst: int, params: bytes) -> bytes:
+    pkt_len = len(params) + 3
+    hdr = bytes([
+        0xFF, 0xFF, 0xFD, 0x00,
+        dev_id,
+        pkt_len & 0xFF,
+        (pkt_len >> 8) & 0xFF,
+        inst,
+    ])
+    pkt = hdr + params
+    crc = _crc16(pkt)
+    return pkt + bytes([crc & 0xFF, (crc >> 8) & 0xFF])
+
+
+def send_calib_command(port: str, subcmd: int, key: int | None = None,
+                       value: float | None = None, dev_id: int = DEV_ID) -> None:
+    params = bytes([subcmd])
+    if subcmd == CALIB_CMD_SET:
+        if key is None or value is None:
+            raise ValueError("SET requires key and value")
+        params += bytes([key]) + struct.pack("<f", float(value))
+
+    # Broadcast ID prevents status replies; avoids RX contention with turtlebot3 node.
+    pkt = _build_instruction(0xFE, INST_CALIBRATION, params)
+    with serial.Serial(port, DXL_BAUD, timeout=0.02, write_timeout=0.2) as ser:
+        ser.write(pkt)
+        ser.flush()
+    time.sleep(0.02)
+
+
+def apply_runtime_calibration(port: str, max_speed: float, trim_l: float, trim_r: float,
+                              min_duty: float | None = None, kick_duty: float | None = None) -> None:
+    send_calib_command(port, CALIB_CMD_SET, CALIB_KEY_MAX_WHEEL_SPEED_MS, max_speed)
+    send_calib_command(port, CALIB_CMD_SET, CALIB_KEY_MOTOR_TRIM_LEFT, trim_l)
+    send_calib_command(port, CALIB_CMD_SET, CALIB_KEY_MOTOR_TRIM_RIGHT, trim_r)
+    if min_duty is not None:
+        send_calib_command(port, CALIB_CMD_SET, CALIB_KEY_MOTOR_MIN_DUTY, min_duty)
+    if kick_duty is not None:
+        send_calib_command(port, CALIB_CMD_SET, CALIB_KEY_MOTOR_KICK_DUTY, kick_duty)
 
 # ─────────────────────────── safety / test constants ───────────────────────
 WALL_STOP_M     = 0.35   # emergency stop if front range drops below this
@@ -1253,31 +1340,31 @@ def apply_corrections(new_max_speed, new_trim_l, new_trim_r,
     hdr("Applying corrections to source files")
 
     info(f"MAX_WHEEL_SPEED_MS : {old_max_speed:.6f} → {new_max_speed:.6f} m/s")
-    write_firmware_float(MAIN_C, "MAX_WHEEL_SPEED_MS", new_max_speed,
+    write_firmware_float(MAIN_C, "MAX_WHEEL_SPEED_MS_DEFAULT", new_max_speed,
                          f"calibrated — straight_calibrate.py")
     ok("MAX_WHEEL_SPEED_MS updated in firmware/main.c")
 
     info(f"MOTOR_TRIM_LEFT  : {old_trim_l:.6f} → {new_trim_l:.6f}")
-    write_firmware_float(MAIN_C, "MOTOR_TRIM_LEFT", new_trim_l,
+    write_firmware_float(MAIN_C, "MOTOR_TRIM_LEFT_DEFAULT", new_trim_l,
                          f"calibrated — straight_calibrate.py")
     ok("MOTOR_TRIM_LEFT updated")
 
     info(f"MOTOR_TRIM_RIGHT : {old_trim_r:.6f} → {new_trim_r:.6f}")
-    write_firmware_float(MAIN_C, "MOTOR_TRIM_RIGHT", new_trim_r,
+    write_firmware_float(MAIN_C, "MOTOR_TRIM_RIGHT_DEFAULT", new_trim_r,
                          f"calibrated — straight_calibrate.py")
     ok("MOTOR_TRIM_RIGHT updated")
 
     if new_min_duty is not None and old_min_duty is not None and \
             abs(new_min_duty - old_min_duty) >= DUTY_CHANGE_MIN:
         info(f"MOTOR_MIN_DUTY   : {old_min_duty:.4f} → {new_min_duty:.4f}")
-        write_firmware_float(MAIN_C, "MOTOR_MIN_DUTY", new_min_duty,
+        write_firmware_float(MAIN_C, "MOTOR_MIN_DUTY_DEFAULT", new_min_duty,
                              f"calibrated — straight_calibrate.py")
         ok("MOTOR_MIN_DUTY updated")
 
     if new_kick_duty is not None and old_kick_duty is not None and \
             abs(new_kick_duty - old_kick_duty) >= DUTY_CHANGE_MIN:
         info(f"MOTOR_KICK_DUTY  : {old_kick_duty:.4f} → {new_kick_duty:.4f}")
-        write_firmware_float(MAIN_C, "MOTOR_KICK_DUTY", new_kick_duty,
+        write_firmware_float(MAIN_C, "MOTOR_KICK_DUTY_DEFAULT", new_kick_duty,
                              f"calibrated — straight_calibrate.py")
         ok("MOTOR_KICK_DUTY updated")
 
@@ -1327,12 +1414,14 @@ def main():
     ap.add_argument("--imu-only", action="store_true",
                     help="Calibrate straightness using IMU/odometry only (ignore LiDAR metrics)")
     ap.add_argument("--no-flash",    action="store_true",
-                    help="Update files but skip rebuild/flash")
+                    help="Do not persist to firmware flash or source files (runtime-only session)")
     ap.add_argument("--verify-only", action="store_true",
                     help="One measurement pass, print results, no changes")
     ap.add_argument("--duty-cal",    action="store_true",
                     help="Run stutter/stall sweep to calibrate MOTOR_MIN_DUTY and "
                          "MOTOR_KICK_DUTY before the main calibration passes")
+    ap.add_argument("--dxl-port", default="/dev/ttyTB3",
+                    help="Dynamixel serial port for runtime calibration (default /dev/ttyTB3)")
     args = ap.parse_args()
 
     print(f"\n{BLD}{'═'*60}")
@@ -1365,12 +1454,15 @@ def main():
     ok("Sensors ready.")
 
     # Read current firmware values
-    cur_max_speed = read_firmware_float(MAIN_C, "MAX_WHEEL_SPEED_MS")
-    cur_trim_l    = read_firmware_float(MAIN_C, "MOTOR_TRIM_LEFT")
-    cur_trim_r    = read_firmware_float(MAIN_C, "MOTOR_TRIM_RIGHT")
-    wheel_sep     = read_firmware_float(MAIN_C, "WHEEL_SEPARATION")
-    cur_min_duty  = read_firmware_float(MAIN_C, "MOTOR_MIN_DUTY")
-    cur_kick_duty = read_firmware_float(MAIN_C, "MOTOR_KICK_DUTY")
+    cur_max_speed = read_firmware_float(MAIN_C, "MAX_WHEEL_SPEED_MS_DEFAULT")
+    cur_trim_l    = read_firmware_float(MAIN_C, "MOTOR_TRIM_LEFT_DEFAULT")
+    cur_trim_r    = read_firmware_float(MAIN_C, "MOTOR_TRIM_RIGHT_DEFAULT")
+    wheel_sep     = read_firmware_float(MAIN_C, "WHEEL_SEPARATION_DEFAULT")
+    cur_min_duty  = read_firmware_float(MAIN_C, "MOTOR_MIN_DUTY_DEFAULT")
+    cur_kick_duty = read_firmware_float(MAIN_C, "MOTOR_KICK_DUTY_DEFAULT")
+
+    orig_min_duty = cur_min_duty
+    orig_kick_duty = cur_kick_duty
 
     if None in (cur_max_speed, cur_trim_l, cur_trim_r, wheel_sep):
         fail("Could not read current firmware parameters from main.c")
@@ -1403,39 +1495,31 @@ def main():
 
             duty_changed = (abs(new_min  - cur_min_duty)  >= DUTY_CHANGE_MIN or
                             abs(new_kick - cur_kick_duty) >= DUTY_CHANGE_MIN)
-            if duty_changed and not args.no_flash:
-                # Write and reflash so subsequent passes use the corrected duty.
-                if abs(new_min - cur_min_duty) >= DUTY_CHANGE_MIN:
-                    write_firmware_float(MAIN_C, "MOTOR_MIN_DUTY", new_min,
-                                         "calibrated — straight_calibrate.py")
-                if abs(new_kick - cur_kick_duty) >= DUTY_CHANGE_MIN:
-                    write_firmware_float(MAIN_C, "MOTOR_KICK_DUTY", new_kick,
-                                         "calibrated — straight_calibrate.py")
-                ok("Duty-cycle values written to firmware/main.c")
-                if not rebuild_flash():
-                    fail("Duty reflash failed — continuing with old firmware.")
-                else:
-                    info("Waiting 5 s for device to re-enumerate…")
-                    time.sleep(5.0)
-                    restart_service()
-                    node.destroy_node()
-                    node = Calibrator()
-                    info("Waiting for topics after duty reflash…")
-                    if not node.wait_for_data(20.0):
-                        fail("Sensors not available after reflash.")
-                        rclpy.shutdown(); sys.exit(1)
-                    # Refresh duty values from what was just written
-                    cur_min_duty  = new_min
+            if duty_changed:
+                try:
+                    apply_runtime_calibration(
+                        args.dxl_port,
+                        max_speed=cur_max_speed,
+                        trim_l=cur_trim_l,
+                        trim_r=cur_trim_r,
+                        min_duty=new_min,
+                        kick_duty=new_kick,
+                    )
+                    cur_min_duty = new_min
                     cur_kick_duty = new_kick
-                    ok("Ready — duty-cycle calibration applied.")
-            elif duty_changed and args.no_flash:
-                warn("Duty changes computed but --no-flash set; values NOT written.")
+                    ok("Duty-cycle values applied live to firmware runtime.")
+                except Exception as e:
+                    warn(f"Runtime duty update failed: {e}")
             else:
                 ok("No duty-cycle changes required.")
         else:
             warn("Duty sweep returned no data; skipping duty calibration.")
 
     n_passes = 1 if args.verify_only else args.passes
+
+    runtime_max_speed = cur_max_speed
+    runtime_trim_l = cur_trim_l
+    runtime_trim_r = cur_trim_r
 
     hdr(f"Running {'verification' if args.verify_only else 'calibration'} "
         f"({'1' if args.verify_only else str(n_passes)} pass{'es' if n_passes>1 else ''})")
@@ -1467,6 +1551,39 @@ def main():
             rclpy.shutdown(); sys.exit(1)
         results.append(r)
         print_pass(i, r, args.distance)
+
+        if not args.verify_only:
+            wall_trusted_i = r.get("wall_metrics_valid", False)
+            if wall_trusted_i and r["lidar_dist"] is not None and r["lidar_dist"] > 0.01 \
+                    and r["odom_dist"] is not None and r["odom_dist"] > 0.01:
+                ratio_i = r["lidar_dist"] / r["odom_dist"]
+                step_max_speed = max(0.05, min(2.0, runtime_max_speed * ratio_i))
+            else:
+                step_max_speed = runtime_max_speed
+
+            drift_i, _ = best_yaw_drift(r)
+            travel_i = r["lidar_dist"] if (wall_trusted_i and r["lidar_dist"] is not None) else r["odom_fwd"]
+            step_trim_l, step_trim_r = compute_trim_correction(
+                drift_i, travel_i, wheel_sep, runtime_trim_l, runtime_trim_r)
+            if abs(math.degrees(drift_i)) < 0.5:
+                step_trim_l, step_trim_r = runtime_trim_l, runtime_trim_r
+
+            try:
+                apply_runtime_calibration(
+                    args.dxl_port,
+                    max_speed=step_max_speed,
+                    trim_l=step_trim_l,
+                    trim_r=step_trim_r,
+                    min_duty=cur_min_duty,
+                    kick_duty=cur_kick_duty,
+                )
+                runtime_max_speed = step_max_speed
+                runtime_trim_l = step_trim_l
+                runtime_trim_r = step_trim_r
+                info(f"Runtime updated: MAX={runtime_max_speed:.6f}, "
+                     f"TRIM_L={runtime_trim_l:.6f}, TRIM_R={runtime_trim_r:.6f}")
+            except Exception as e:
+                warn(f"Runtime calibration update failed: {e}")
 
     # ── Aggregate ───
     avg = aggregate(results)
@@ -1502,90 +1619,29 @@ def main():
             warn("Calibration recommended.  Rerun without --verify-only.")
         node.destroy_node(); rclpy.shutdown(); return
 
-    # ── Compute new parameters ──
-    hdr("Computing corrections")
+    # Runtime values already iterated per pass.
+    new_max_speed = runtime_max_speed
+    new_trim_l = runtime_trim_l
+    new_trim_r = runtime_trim_r
 
-    # 1. MAX_WHEEL_SPEED_MS from LiDAR ground-truth distance (only when wall trusted)
-    if wall_trusted and avg["lidar_dist"] is not None and avg["lidar_dist"] > 0.01 \
-            and avg["odom_dist"] is not None and avg["odom_dist"] > 0.01:
-        ratio = avg["lidar_dist"] / avg["odom_dist"]
-        new_max_speed = max(0.05, min(2.0, cur_max_speed * ratio))
-        info(f"MAX_WHEEL_SPEED_MS: {cur_max_speed:.6f} → {new_max_speed:.6f} m/s  "
-             f"(LiDAR {avg['lidar_dist']*100:.2f} cm vs odom {avg['odom_dist']*100:.2f} cm, "
-             f"ratio {ratio:.4f})")
-    else:
-        new_max_speed = cur_max_speed
-        if not wall_trusted:
-            warn("LiDAR not trusted (robot off-perpendicular) — MAX_WHEEL_SPEED_MS unchanged.")
-        else:
-            warn("No reliable LiDAR distance — MAX_WHEEL_SPEED_MS unchanged.")
-
-    # 2. Motor trim from yaw drift
-    # Use LiDAR distance for travel if trusted, else fall back to odom
-    travel = avg["lidar_dist"] if (wall_trusted and avg["lidar_dist"] is not None) \
-             else avg["odom_fwd"]
-    new_trim_l, new_trim_r = compute_trim_correction(
-        drift, travel, wheel_sep, cur_trim_l, cur_trim_r)
-    info(f"Trim correction: L {cur_trim_l:.6f} → {new_trim_l:.6f}  "
-         f"R {cur_trim_r:.6f} → {new_trim_r:.6f}")
-    info(f"  (yaw drift {math.degrees(drift):+.2f}° over "
-         f"{travel*100:.1f} cm @ sep={wheel_sep*100:.1f} cm, "
-         f"damp={CORRECTION_DAMP:.0%}, source: {drift_src})")
-
-    # Sanity-check: if drift is negligible, keep existing trims
-    if abs(math.degrees(drift)) < 0.5:
-        info("Yaw drift < 0.5° — motor trims unchanged (already balanced).")
-        new_trim_l, new_trim_r = cur_trim_l, cur_trim_r
-
-    # ── Apply to files ──
-    apply_corrections(new_max_speed, new_trim_l, new_trim_r,
-                      cur_max_speed, cur_trim_l, cur_trim_r)
+    hdr("Final calibrated values")
+    info(f"MAX_WHEEL_SPEED_MS: {cur_max_speed:.6f} → {new_max_speed:.6f}")
+    info(f"MOTOR_TRIM_LEFT   : {cur_trim_l:.6f} → {new_trim_l:.6f}")
+    info(f"MOTOR_TRIM_RIGHT  : {cur_trim_r:.6f} → {new_trim_r:.6f}")
 
     if args.no_flash:
-        warn("--no-flash: files updated but firmware NOT rebuilt.")
-        warn("Run:  cd firmware && ./build.sh flash")
+        warn("--no-flash: runtime updates applied only; not writing source files or firmware flash")
         node.destroy_node(); rclpy.shutdown(); return
 
-    # ── Rebuild & flash ──
-    if not rebuild_flash():
-        node.destroy_node(); rclpy.shutdown(); sys.exit(1)
-
-    # Brief pause for the device to re-enumerate, then restart the service
-    info("Waiting 5 s for device to re-enumerate…")
-    time.sleep(5.0)
-    restart_service()
-
-    # Wait for ROS topics to come back with a fresh node
-    node.destroy_node()
-    node = Calibrator()
-    info("Waiting for topics after reflash…")
-    if not node.wait_for_data(20.0):
-        warn("Topics not yet available — skipping verification pass.")
-        node.destroy_node(); rclpy.shutdown(); return
-
-    # ── Verification pass ──
-    hdr("Verification pass (with new firmware)")
-    print(f"{YLW}Return robot to start position and press Enter.{NC}")
+    apply_corrections(new_max_speed, new_trim_l, new_trim_r,
+                      cur_max_speed, cur_trim_l, cur_trim_r,
+                      new_min_duty=cur_min_duty, old_min_duty=orig_min_duty,
+                      new_kick_duty=cur_kick_duty, old_kick_duty=orig_kick_duty)
     try:
-        input()
-    except EOFError:
-        pass
-
-    vr = node.run_pass(args.distance, args.speed)
-    if vr is None:
-        warn("Verification aborted.")
-    else:
-        print_pass(0, vr, args.distance)
-        v_drift, v_src = best_yaw_drift(vr)
-        lat_mm = abs(vr["odom_lat"]) * 1000
-        hdr("Final calibration quality")
-        if abs(math.degrees(v_drift)) < 1.5 and lat_mm < 5.0:
-            ok(f"Straight-line calibration COMPLETE — "
-               f"drift={math.degrees(v_drift):+.2f}°, lateral={lat_mm:.1f} mm")
-        else:
-            warn(f"Residual drift: {math.degrees(v_drift):+.2f}° / "
-                 f"{lat_mm:.1f} mm lateral.  "
-                 f"Rerun to iterate further.")
+        send_calib_command(args.dxl_port, CALIB_CMD_SAVE)
+        ok("Persisted runtime calibration to firmware flash")
+    except Exception as e:
+        warn(f"Could not persist runtime calibration to flash: {e}")
 
     node.destroy_node()
     rclpy.shutdown()
