@@ -152,7 +152,7 @@ def apply_runtime_calibration(port: str, max_speed: float, trim_l: float, trim_r
         send_calib_command(port, CALIB_CMD_SET, CALIB_KEY_MOTOR_KICK_DUTY, kick_duty)
 
 # ─────────────────────────── safety / test constants ───────────────────────
-WALL_STOP_M     = 0.35   # emergency stop if front range drops below this
+WALL_STOP_M     = 0.1   # emergency stop if front range drops below this
 WALL_WARN_M     = 0.50   # warning banner threshold
 SCAN_WINDOW_DEG = 40.0   # degrees either side of front used for wall-plane fit
 MIN_WALL_PTS    = 8      # minimum valid scan points for a reliable fit
@@ -1357,9 +1357,11 @@ def apply_corrections(new_max_speed, new_trim_l, new_trim_r,
     if new_min_duty is not None and old_min_duty is not None and \
             abs(new_min_duty - old_min_duty) >= DUTY_CHANGE_MIN:
         info(f"MOTOR_MIN_DUTY   : {old_min_duty:.4f} → {new_min_duty:.4f}")
-        write_firmware_float(MAIN_C, "MOTOR_MIN_DUTY_DEFAULT", new_min_duty,
+        write_firmware_float(MAIN_C, "MOTOR_MIN_DUTY_LEFT_DEFAULT", new_min_duty,
                              f"calibrated — straight_calibrate.py")
-        ok("MOTOR_MIN_DUTY updated")
+        write_firmware_float(MAIN_C, "MOTOR_MIN_DUTY_RIGHT_DEFAULT", new_min_duty,
+                             f"calibrated — straight_calibrate.py")
+        ok("MOTOR_MIN_DUTY_LEFT/RIGHT updated")
 
     if new_kick_duty is not None and old_kick_duty is not None and \
             abs(new_kick_duty - old_kick_duty) >= DUTY_CHANGE_MIN:
@@ -1458,7 +1460,9 @@ def main():
     cur_trim_l    = read_firmware_float(MAIN_C, "MOTOR_TRIM_LEFT_DEFAULT")
     cur_trim_r    = read_firmware_float(MAIN_C, "MOTOR_TRIM_RIGHT_DEFAULT")
     wheel_sep     = read_firmware_float(MAIN_C, "WHEEL_SEPARATION_DEFAULT")
-    cur_min_duty  = read_firmware_float(MAIN_C, "MOTOR_MIN_DUTY_DEFAULT")
+    cur_min_duty_l = read_firmware_float(MAIN_C, "MOTOR_MIN_DUTY_LEFT_DEFAULT")
+    cur_min_duty_r = read_firmware_float(MAIN_C, "MOTOR_MIN_DUTY_RIGHT_DEFAULT")
+    cur_min_duty  = max(cur_min_duty_l or 0.0, cur_min_duty_r or 0.0) or None
     cur_kick_duty = read_firmware_float(MAIN_C, "MOTOR_KICK_DUTY_DEFAULT")
 
     orig_min_duty = cur_min_duty

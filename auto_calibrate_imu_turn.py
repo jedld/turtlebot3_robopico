@@ -81,10 +81,15 @@ Usage
 
 import argparse
 import math
+import os
 import re
+import select as _select_mod
 import struct
 import subprocess
+import sys
+import termios
 import time
+import tty
 from pathlib import Path
 from typing import NamedTuple, Optional
 
@@ -118,6 +123,8 @@ CALIB_KEY_MOTOR_KICK_DUTY    = 0x05
 CALIB_KEY_MOTOR_KICK_CYCLES  = 0x06
 CALIB_KEY_MOTOR_TRIM_LEFT    = 0x07
 CALIB_KEY_MOTOR_TRIM_RIGHT   = 0x08
+CALIB_KEY_MOTOR_MIN_DUTY_LEFT  = 0x0B
+CALIB_KEY_MOTOR_MIN_DUTY_RIGHT = 0x0C
 
 
 def _make_crc_table() -> list[int]:
@@ -438,6 +445,197 @@ def quat_to_yaw(msg: Imu) -> float:
     siny = 2.0 * (o.w * o.z + o.x * o.y)
     cosy = 1.0 - 2.0 * (o.y * o.y + o.z * o.z)
     return math.atan2(siny, cosy)
+
+
+# ── Interactive test helper ─────────────────────────────────────────────────
+
+def interactive_test(node: "TurnCalibrator", port: str, speed: float,
+                    target_deg: float, new_sep: float, old_sep: float,
+                    damping: float) -> float:
+    """
+    Let the user drive test rotations with the current WHEEL_SEPARATION and
+    optionally adjust it interactively before committing.
+
+    Returns the (possibly adjusted) new_sep value.
+    """
+    BOLD   = "\033[1m"
+    DIM    = "\033[2m"
+    GREEN  = "\033[32m"
+    CYAN   = "\033[36m"
+    YELLOW = "\033[33m"
+    RED    = "\033[31m"
+    RESET  = "\033[0m"
+
+    target_rad = math.radians(target_deg)
+    sep = new_sep
+
+    def _getch(fd, timeout=0.05):
+        rlist, _, _ = _select_mod.select([fd], [], [], timeout)
+        if rlist:
+            return os.read(fd, 8).decode("utf-8", errors="ignore")
+        return ""
+
+    print(f"\n{BOLD}═══ Interactive Motor Test ═══{RESET}")
+    print(f"  Current WHEEL_SEP = {CYAN}{sep*100:.4f} cm{RESET}  "
+          f"(was {old_sep*100:.4f} cm)")
+    print()
+    print(f"  {BOLD}T{RESET}       — execute a {target_deg:.0f}° test turn (measure with IMU)")
+    print(f"  {BOLD}W/S{RESET}     — drive forward / backward")
+    print(f"  {BOLD}A/D{RESET}     — rotate left / right at test speed")
+    print(f"  {BOLD}Space{RESET}   — stop motors")
+    print(f"  {BOLD}+/-{RESET}     — nudge WHEEL_SEP by +/- 0.02 cm")
+    print(f"  {BOLD}]/[{RESET}     — nudge WHEEL_SEP by +/- 0.1 cm")
+    print(f"  {BOLD}V{RESET}       — enter WHEEL_SEP value manually")
+    print(f"  {BOLD}Enter{RESET}   — accept current value and continue")
+    print(f"  {BOLD}Esc/Q{RESET}   — accept current value and continue")
+    print()
+
+    fd = sys.stdin.fileno()
+    old_term = termios.tcgetattr(fd)
+    lin_x = 0.0
+    ang_z = 0.0
+
+    try:
+        tty.setraw(fd)
+        running = True
+        while running:
+            rclpy.spin_once(node, timeout_sec=0.01)
+            key = _getch(fd, timeout=0.05)
+
+            if key in ("t", "T"):
+                # Full measured test turn
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
+                print(f"\r\n  Executing {target_deg:.0f}° test turn ... ", end="", flush=True)
+
+                # Reset integrator and do the turn
+                node.cum_yaw = 0.0
+                node._last_imu_stamp = None
+                node.collecting = True
+                duration = abs(target_rad / speed)
+                end_t = time.time() + duration
+                while time.time() < end_t:
+                    node.send(0.0, speed)
+                    rclpy.spin_once(node, timeout_sec=0.05)
+                node.collecting = False
+                node.stop(1.0)
+                measured_rad = abs(node.cum_yaw)
+                measured_deg_val = math.degrees(measured_rad)
+                error_deg = measured_deg_val - target_deg
+
+                if measured_rad > math.radians(5):
+                    ratio = target_rad / measured_rad
+                    suggested = sep * (1.0 + damping * (ratio - 1.0))
+                    suggested = max(0.01, min(0.50, suggested))
+                else:
+                    suggested = sep
+
+                color = GREEN if abs(error_deg) < 3.0 else (YELLOW if abs(error_deg) < 8.0 else RED)
+                print(f"{color}{measured_deg_val:.2f}°{RESET}  "
+                      f"(target {target_deg:.0f}°, error {error_deg:+.2f}°)")
+                if abs(error_deg) > 1.0:
+                    print(f"  Suggested SEP = {suggested*100:.4f} cm  "
+                          f"(currently {sep*100:.4f} cm)")
+                    apply_ch = input(f"  Apply suggested? (y/N): ").strip().lower()
+                    if apply_ch == "y":
+                        sep = suggested
+                        try:
+                            send_calib_command(
+                                port=port, subcmd=CALIB_CMD_SET,
+                                key=CALIB_KEY_WHEEL_SEPARATION, value=sep,
+                            )
+                            print(f"  {GREEN}Applied WHEEL_SEP = {sep*100:.4f} cm to runtime{RESET}")
+                        except Exception as e:
+                            print(f"  {RED}Failed: {e}{RESET}")
+                else:
+                    print(f"  {GREEN}Looks good!{RESET}")
+
+                tty.setraw(fd)
+                lin_x, ang_z = 0.0, 0.0
+
+            elif key == "w":
+                lin_x, ang_z = 0.05, 0.0
+            elif key == "s":
+                lin_x, ang_z = -0.05, 0.0
+            elif key == "a":
+                lin_x, ang_z = 0.0, speed
+            elif key == "d":
+                lin_x, ang_z = 0.0, -speed
+            elif key == " ":
+                lin_x, ang_z = 0.0, 0.0
+            elif key in ("+", "="):
+                sep += 0.0002  # 0.02 cm
+                sep = min(sep, 0.50)
+                send_calib_command(port, CALIB_CMD_SET,
+                                   CALIB_KEY_WHEEL_SEPARATION, sep)
+            elif key == "-":
+                sep -= 0.0002
+                sep = max(sep, 0.01)
+                send_calib_command(port, CALIB_CMD_SET,
+                                   CALIB_KEY_WHEEL_SEPARATION, sep)
+            elif key == "]":
+                sep += 0.001  # 0.1 cm
+                sep = min(sep, 0.50)
+                send_calib_command(port, CALIB_CMD_SET,
+                                   CALIB_KEY_WHEEL_SEPARATION, sep)
+            elif key == "[":
+                sep -= 0.001
+                sep = max(sep, 0.01)
+                send_calib_command(port, CALIB_CMD_SET,
+                                   CALIB_KEY_WHEEL_SEPARATION, sep)
+            elif key in ("v", "V"):
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
+                try:
+                    raw = input(f"\r  Enter WHEEL_SEP in cm: ")
+                    val = float(raw.strip()) / 100.0
+                    val = max(0.01, min(0.50, val))
+                    sep = val
+                    send_calib_command(port, CALIB_CMD_SET,
+                                       CALIB_KEY_WHEEL_SEPARATION, sep)
+                    print(f"  {GREEN}Set WHEEL_SEP = {sep*100:.4f} cm{RESET}")
+                except (ValueError, EOFError):
+                    print(f"  {RED}Invalid input.{RESET}")
+                tty.setraw(fd)
+                lin_x, ang_z = 0.0, 0.0
+            elif key in ("\r", "\n", "\x1b", "q", "Q", "\x03"):
+                running = False
+                lin_x, ang_z = 0.0, 0.0
+            elif key == "":
+                pass  # timeout, keep current command
+            else:
+                lin_x, ang_z = 0.0, 0.0
+
+            node.send(lin_x, ang_z)
+
+            # Gyro readout from IMU callback
+            gyro = node.last_yaw  # reuse existing attribute existence
+            imu_str = ""
+            # The node has _gyro_samples but we want live angular_velocity.
+            # We'll just show the integrated yaw so far.
+
+            dir_str = "STOP"
+            if lin_x > 0:
+                dir_str = "FWD "
+            elif lin_x < 0:
+                dir_str = "BWD "
+            elif ang_z > 0:
+                dir_str = "LEFT"
+            elif ang_z < 0:
+                dir_str = "RGHT"
+
+            sys.stdout.write(
+                f"\r  [{BOLD}{dir_str}{RESET}]  "
+                f"SEP={CYAN}{sep*100:.4f}{RESET}cm  "
+                f"lin={lin_x:+.3f}  ang={ang_z:+.2f}     "
+            )
+            sys.stdout.flush()
+
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
+        node.stop(0.3)
+
+    print(f"\n\n  Final WHEEL_SEP = {GREEN}{sep*100:.4f} cm{RESET}  "
+          f"({sep:.6f} m)\n")
+    return sep
 
 
 class TurnCalibrator(Node):
@@ -873,22 +1071,30 @@ def main():
 
     # Read motor kick/min-duty defaults from the source so we can restore later
     orig_kick_cycles = read_define_float(MAIN_C, "MOTOR_KICK_CYCLES_DEFAULT")
-    orig_min_duty    = read_define_float(MAIN_C, "MOTOR_MIN_DUTY_DEFAULT")
+    orig_min_duty_l  = read_define_float(MAIN_C, "MOTOR_MIN_DUTY_LEFT_DEFAULT")
+    orig_min_duty_r  = read_define_float(MAIN_C, "MOTOR_MIN_DUTY_RIGHT_DEFAULT")
+    orig_min_duty    = max(orig_min_duty_l or 0.0, orig_min_duty_r or 0.0) or None
 
     if real_imu or use_lidar:
         # ── Temporarily soften motor parameters for calibration turns ─────
         # Suppress kick-start burst — it adds uncontrolled angular impulse
         # at the start of each turn, increasing measurement variance.
-        # Also lower MOTOR_MIN_DUTY slightly to reduce the dead-zone floor
-        # (but keep enough to overcome static friction).
-        calib_min_duty = min(0.40, orig_min_duty) if orig_min_duty else 0.0
+        # Per-motor dead-zone: never lower below each motor's own calibrated
+        # value (that would cause stalls, especially with asymmetric motors).
+        calib_min_duty_l = orig_min_duty_l or 0.0
+        calib_min_duty_r = orig_min_duty_r or 0.0
         try:
             send_calib_command(args.dxl_port, CALIB_CMD_SET,
                                CALIB_KEY_MOTOR_KICK_CYCLES, value=0.0)
             send_calib_command(args.dxl_port, CALIB_CMD_SET,
-                               CALIB_KEY_MOTOR_MIN_DUTY, value=calib_min_duty)
-            print(f"Motor prep      : KICK_CYCLES=0, MIN_DUTY={calib_min_duty:.2f} "
-                  f"(was {orig_min_duty:.2f})")
+                               CALIB_KEY_MOTOR_MIN_DUTY_LEFT,
+                               value=calib_min_duty_l)
+            send_calib_command(args.dxl_port, CALIB_CMD_SET,
+                               CALIB_KEY_MOTOR_MIN_DUTY_RIGHT,
+                               value=calib_min_duty_r)
+            print(f"Motor prep      : KICK_CYCLES=0, "
+                  f"MIN_DUTY_L={calib_min_duty_l:.2f} "
+                  f"MIN_DUTY_R={calib_min_duty_r:.2f}")
         except Exception as e:
             print(f"Warning         : motor prep failed ({e})")
 
@@ -988,11 +1194,15 @@ def main():
                 send_calib_command(args.dxl_port, CALIB_CMD_SET,
                                    CALIB_KEY_MOTOR_KICK_CYCLES,
                                    value=float(orig_kick_cycles))
-            if orig_min_duty is not None:
+            if orig_min_duty_l is not None:
                 send_calib_command(args.dxl_port, CALIB_CMD_SET,
-                                   CALIB_KEY_MOTOR_MIN_DUTY,
-                                   value=float(orig_min_duty))
-            print("Motor restore   : KICK_CYCLES and MIN_DUTY back to defaults")
+                                   CALIB_KEY_MOTOR_MIN_DUTY_LEFT,
+                                   value=float(orig_min_duty_l))
+            if orig_min_duty_r is not None:
+                send_calib_command(args.dxl_port, CALIB_CMD_SET,
+                                   CALIB_KEY_MOTOR_MIN_DUTY_RIGHT,
+                                   value=float(orig_min_duty_r))
+            print("Motor restore   : KICK_CYCLES and MIN_DUTY_L/R back to defaults")
         except Exception as e:
             print(f"Warning         : motor restore failed ({e})")
     else:
@@ -1021,15 +1231,17 @@ def main():
                 time.sleep(0.8)
 
     node.stop(0.2)
-    node.destroy_node()
-    rclpy.shutdown()
 
     if not measurements:
+        node.destroy_node()
+        rclpy.shutdown()
         print("ERROR: no valid measurements collected.")
         return 3
 
     avg_measured = sum(measurements) / len(measurements)
     if avg_measured < math.radians(5):
+        node.destroy_node()
+        rclpy.shutdown()
         print("ERROR: measured angle too small to calibrate reliably.")
         return 3
 
@@ -1058,6 +1270,23 @@ def main():
     print(f"new WHEEL_SEP   : {new_sep*100:.4f} cm  ({new_sep:.6f} m)")
     print(f"Runtime updates : {len(sep_history)-1} iterative step(s)")
     print(f"Formula/step    : sep := sep × (1 + {args.damping:.2f}×(desired/measured-1))")
+
+    # ── Interactive test opportunity ───────────────────────────────────────
+    try:
+        do_test = input("\nWould you like to test the new value interactively? (y/N): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        do_test = "n"
+
+    if do_test == "y":
+        new_sep = interactive_test(
+            node, args.dxl_port, args.speed,
+            target_deg=args.angle, new_sep=new_sep, old_sep=old_sep,
+            damping=args.damping,
+        )
+        print(f"Using WHEEL_SEP = {new_sep*100:.4f} cm  ({new_sep:.6f} m)")
+
+    node.destroy_node()
+    rclpy.shutdown()
 
     if args.apply:
         write_define_float(

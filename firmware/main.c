@@ -30,6 +30,8 @@
  *                  High = mains disconnected (robot running on battery)
  *   UPS LBAT     : GP27 = Grove 6, pin 2 (White)  — X-UPS1 Low Battery signal
  *                  High = battery ≤ 3 V per cell (pack ≤ 12 V); cut-off imminent
+ *   Ultrasonic 1 : GP2  = Grove 2, pin 1 (Yellow) — Grove Ultrasonic Ranger V2.0
+ *   Ultrasonic 2 : GP4  = Grove 3, pin 1 (Yellow) — Grove Ultrasonic Ranger V2.0
  *
  * Register map: control_table.hpp in turtlebot3_node
  */
@@ -73,6 +75,11 @@
 #define PIN_UPS_PLD   26u     // GP26 = Grove 6, pin 1 (Yellow) — Power Loss Detect
 #define PIN_UPS_LBAT  27u     // GP27 = Grove 6, pin 2 (White)  — Low Battery
 
+// Grove Ultrasonic Ranger V2.0 — single SIG pin per sensor.
+// Both sensors are front-facing for distance calibration.
+#define PIN_USS_1     2u      // GP2 = Grove 2, pin 1 (Yellow) — Ultrasonic sensor 1
+#define PIN_USS_2     4u      // GP4 = Grove 3, pin 1 (Yellow) — Ultrasonic sensor 2
+
 
 // Pico 2 system clock — use the SDK-defined SYS_CLK_HZ (150 MHz for RP2350).
 // Do not redefine; it comes from hardware/platform_defs.h.
@@ -103,25 +110,28 @@
 #define WHEEL_RADIUS_DEFAULT        0.361910f  // metres — calibrated (723.8 mm diam. effective)
 // ANGULAR CALIBRATION: do NOT use a scale factor (it breaks odometry).
 // Tune WHEEL_SEPARATION to match effective turning base; run auto_calibrate_imu_turn.py.
-#define WHEEL_SEPARATION_DEFAULT    0.224042f  // metres — effective turning base; calibrated by auto_calibrate_imu_turn.py
+#define WHEEL_SEPARATION_DEFAULT    0.127735f  // metres — effective turning base; calibrated by auto_calibrate_imu_turn.py
 #define MAX_WHEEL_SPEED_MS_DEFAULT  2.000000f  // calibrated — straight_calibrate.py
-#define RIGHT_MOTOR_REVERSED_DEFAULT 0       // set to 1 if right wheel spins backward
+#define LEFT_MOTOR_REVERSED_DEFAULT  1       // set to 1 if left wheel spins backward
+#define RIGHT_MOTOR_REVERSED_DEFAULT 1       // set to 1 if right wheel spins backward
 #define SWAP_LEFT_RIGHT_MOTORS_DEFAULT 1      // set to 1 if M1/M2 are physically wired to opposite sides
 
 // Minimum duty cycle (dead-zone compensation).
-// TT DC Dual Metal Gearbox Motor (1:90) — higher gear ratio means more
-// torque at lower speed; stall-threshold duty may differ from 1:48.
+// DFRobot FIT0450 TT Motor with Encoder (6V 160RPM 120:1) — higher gear
+// ratio means more torque at lower speed; per-motor values compensate for
+// manufacturing differences between left and right motors.
 // Any non-zero throttle is boosted to at least this value.
 // Set to 0.0f to disable.  Range: 0.0 – 1.0.
-// Re-run straight_calibrate.py if motors stall or overshoot.
-#define MOTOR_MIN_DUTY_DEFAULT      0.28f  // calibrated — calibrate_deadzone.py
+// Re-run calibrate_deadzone.py if motors stall or overshoot.
+#define MOTOR_MIN_DUTY_LEFT_DEFAULT   0.50f  // calibrated — calibrate_deadzone.py
+#define MOTOR_MIN_DUTY_RIGHT_DEFAULT  0.36f  // calibrated — calibrate_deadzone.py
 
 // Kick-start: when a motor transitions from stopped to moving (or reverses
 // direction), apply KICK_DUTY for KICK_CYCLES odometry cycles to overcome
 // static friction, then settle to normal (dead-zone compensated) duty.
 // Particularly important for pivot turns where individual wheel velocities
 // are very small.  Set KICK_CYCLES to 0 to disable.
-#define MOTOR_KICK_DUTY_DEFAULT     0.33f  // calibrated — calibrate_deadzone.py
+#define MOTOR_KICK_DUTY_DEFAULT     0.55f  // calibrated — calibrate_deadzone.py
 #define MOTOR_KICK_CYCLES_DEFAULT   3u  // calibrated — calibrate_deadzone.py
 
 // Per-motor throttle trim — compensates for manufacturing differences between
@@ -138,9 +148,11 @@
 static float cfg_wheel_radius = WHEEL_RADIUS_DEFAULT;
 static float cfg_wheel_separation = WHEEL_SEPARATION_DEFAULT;
 static float cfg_max_wheel_speed_ms = MAX_WHEEL_SPEED_MS_DEFAULT;
+static uint8_t cfg_left_motor_reversed = LEFT_MOTOR_REVERSED_DEFAULT;
 static uint8_t cfg_right_motor_reversed = RIGHT_MOTOR_REVERSED_DEFAULT;
 static uint8_t cfg_swap_left_right_motors = SWAP_LEFT_RIGHT_MOTORS_DEFAULT;
-static float cfg_motor_min_duty = MOTOR_MIN_DUTY_DEFAULT;
+static float cfg_motor_min_duty_left = MOTOR_MIN_DUTY_LEFT_DEFAULT;
+static float cfg_motor_min_duty_right = MOTOR_MIN_DUTY_RIGHT_DEFAULT;
 static float cfg_motor_kick_duty = MOTOR_KICK_DUTY_DEFAULT;
 static uint8_t cfg_motor_kick_cycles = MOTOR_KICK_CYCLES_DEFAULT;
 static float cfg_motor_trim_left = MOTOR_TRIM_LEFT_DEFAULT;
@@ -159,7 +171,7 @@ static inline float rpm_per_ms(void) {
 }
 
 #define CALIB_FLASH_MAGIC   0x43414C31u  // "CAL1"
-#define CALIB_FLASH_VERSION 1u
+#define CALIB_FLASH_VERSION 2u
 #define CALIB_FLASH_OFFSET  (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
 
 typedef struct {
@@ -169,12 +181,13 @@ typedef struct {
     float wheel_radius;
     float wheel_separation;
     float max_wheel_speed_ms;
-    float motor_min_duty;
+    float motor_min_duty_left;
+    float motor_min_duty_right;
     float motor_kick_duty;
     uint8_t motor_kick_cycles;
     uint8_t right_motor_reversed;
     uint8_t swap_left_right_motors;
-    uint8_t reserved0;
+    uint8_t left_motor_reversed;
     float motor_trim_left;
     float motor_trim_right;
     uint32_t checksum;
@@ -197,11 +210,13 @@ static void fill_calib_blob(calib_flash_t *blob) {
     blob->wheel_radius = cfg_wheel_radius;
     blob->wheel_separation = cfg_wheel_separation;
     blob->max_wheel_speed_ms = cfg_max_wheel_speed_ms;
-    blob->motor_min_duty = cfg_motor_min_duty;
+    blob->motor_min_duty_left = cfg_motor_min_duty_left;
+    blob->motor_min_duty_right = cfg_motor_min_duty_right;
     blob->motor_kick_duty = cfg_motor_kick_duty;
     blob->motor_kick_cycles = cfg_motor_kick_cycles;
     blob->right_motor_reversed = cfg_right_motor_reversed;
     blob->swap_left_right_motors = cfg_swap_left_right_motors;
+    blob->left_motor_reversed = cfg_left_motor_reversed;
     blob->motor_trim_left = cfg_motor_trim_left;
     blob->motor_trim_right = cfg_motor_trim_right;
     blob->checksum = fnv1a32((const uint8_t *)blob, (uint32_t)(sizeof(calib_flash_t) - sizeof(uint32_t)));
@@ -217,7 +232,8 @@ static bool is_calib_blob_valid(const calib_flash_t *blob) {
     if (blob->wheel_radius < 0.01f || blob->wheel_radius > 1.0f) return false;
     if (blob->wheel_separation < 0.01f || blob->wheel_separation > 1.0f) return false;
     if (blob->max_wheel_speed_ms < 0.01f || blob->max_wheel_speed_ms > 5.0f) return false;
-    if (blob->motor_min_duty < 0.0f || blob->motor_min_duty > 1.0f) return false;
+    if (blob->motor_min_duty_left < 0.0f || blob->motor_min_duty_left > 1.0f) return false;
+    if (blob->motor_min_duty_right < 0.0f || blob->motor_min_duty_right > 1.0f) return false;
     if (blob->motor_kick_duty < 0.0f || blob->motor_kick_duty > 1.0f) return false;
     if (blob->motor_kick_cycles > 20u) return false;
     if (blob->motor_trim_left < 0.5f || blob->motor_trim_left > 1.5f) return false;
@@ -229,11 +245,13 @@ static void apply_calib_blob(const calib_flash_t *blob) {
     cfg_wheel_radius = blob->wheel_radius;
     cfg_wheel_separation = blob->wheel_separation;
     cfg_max_wheel_speed_ms = blob->max_wheel_speed_ms;
-    cfg_motor_min_duty = blob->motor_min_duty;
+    cfg_motor_min_duty_left = blob->motor_min_duty_left;
+    cfg_motor_min_duty_right = blob->motor_min_duty_right;
     cfg_motor_kick_duty = blob->motor_kick_duty;
     cfg_motor_kick_cycles = blob->motor_kick_cycles;
     cfg_right_motor_reversed = blob->right_motor_reversed ? 1u : 0u;
     cfg_swap_left_right_motors = blob->swap_left_right_motors ? 1u : 0u;
+    cfg_left_motor_reversed = blob->left_motor_reversed ? 1u : 0u;
     cfg_motor_trim_left = blob->motor_trim_left;
     cfg_motor_trim_right = blob->motor_trim_right;
 }
@@ -406,6 +424,14 @@ static inline void w_f32(uint addr, float v) {
 #define ADDR_DBG_I2C0_DEV5      182u
 #define ADDR_DBG_I2C0_DEV6      183u
 
+// Ultrasonic distance sensors — Grove Ultrasonic Ranger V2.0 (read-only + enable)
+// Write ADDR_USS_ENABLE to activate; readings update at ~10 Hz per sensor (staggered).
+#define ADDR_USS_ENABLE         184u  // 1 byte, write: bit 0 = USS1 en, bit 1 = USS2 en
+#define ADDR_USS_STATUS         185u  // 1 byte, read:  bit 0 = USS1 valid,  bit 1 = USS2 valid
+                                      //                bit 4 = USS1 timeout, bit 5 = USS2 timeout
+#define ADDR_USS_1_DIST_MM      186u  // uint16, read: sensor 1 distance in mm (0xFFFF = timeout)
+#define ADDR_USS_2_DIST_MM      188u  // uint16, read: sensor 2 distance in mm (0xFFFF = timeout)
+
 static void init_registers(void) {
     memset(regs, 0, REG_SIZE);
     w_u16(ADDR_MODEL_NUMBER,    MODEL_NUMBER);
@@ -558,6 +584,9 @@ static volatile uint64_t last_host_comm_us  = 0;
 #define CALIB_KEY_MOTOR_TRIM_RIGHT    0x08u
 #define CALIB_KEY_RIGHT_MOTOR_REVERSED 0x09u
 #define CALIB_KEY_SWAP_MOTORS         0x0Au
+#define CALIB_KEY_MOTOR_MIN_DUTY_LEFT  0x0Bu
+#define CALIB_KEY_MOTOR_MIN_DUTY_RIGHT 0x0Cu
+#define CALIB_KEY_LEFT_MOTOR_REVERSED  0x0Du
 
 static void send_packet(uint32_t len);
 
@@ -587,7 +616,16 @@ static bool set_calibration_value(uint8_t key, float value) {
             return true;
         case CALIB_KEY_MOTOR_MIN_DUTY:
             if (value < 0.0f || value > 1.0f) return false;
-            cfg_motor_min_duty = value;
+            cfg_motor_min_duty_left = value;
+            cfg_motor_min_duty_right = value;
+            return true;
+        case CALIB_KEY_MOTOR_MIN_DUTY_LEFT:
+            if (value < 0.0f || value > 1.0f) return false;
+            cfg_motor_min_duty_left = value;
+            return true;
+        case CALIB_KEY_MOTOR_MIN_DUTY_RIGHT:
+            if (value < 0.0f || value > 1.0f) return false;
+            cfg_motor_min_duty_right = value;
             return true;
         case CALIB_KEY_MOTOR_KICK_DUTY:
             if (value < 0.0f || value > 1.0f) return false;
@@ -611,6 +649,9 @@ static bool set_calibration_value(uint8_t key, float value) {
         case CALIB_KEY_SWAP_MOTORS:
             cfg_swap_left_right_motors = (value >= 0.5f) ? 1u : 0u;
             return true;
+        case CALIB_KEY_LEFT_MOTOR_REVERSED:
+            cfg_left_motor_reversed = (value >= 0.5f) ? 1u : 0u;
+            return true;
         default:
             return false;
     }
@@ -620,9 +661,11 @@ static void reset_calibration_defaults(void) {
     cfg_wheel_radius = WHEEL_RADIUS_DEFAULT;
     cfg_wheel_separation = WHEEL_SEPARATION_DEFAULT;
     cfg_max_wheel_speed_ms = MAX_WHEEL_SPEED_MS_DEFAULT;
+    cfg_left_motor_reversed = LEFT_MOTOR_REVERSED_DEFAULT;
     cfg_right_motor_reversed = RIGHT_MOTOR_REVERSED_DEFAULT;
     cfg_swap_left_right_motors = SWAP_LEFT_RIGHT_MOTORS_DEFAULT;
-    cfg_motor_min_duty = MOTOR_MIN_DUTY_DEFAULT;
+    cfg_motor_min_duty_left = MOTOR_MIN_DUTY_LEFT_DEFAULT;
+    cfg_motor_min_duty_right = MOTOR_MIN_DUTY_RIGHT_DEFAULT;
     cfg_motor_kick_duty = MOTOR_KICK_DUTY_DEFAULT;
     cfg_motor_kick_cycles = MOTOR_KICK_CYCLES_DEFAULT;
     cfg_motor_trim_left = MOTOR_TRIM_LEFT_DEFAULT;
@@ -659,12 +702,14 @@ static void handle_calibration(uint8_t dev_id, const uint8_t *params, uint16_t n
         write_f32_le(&out[9],  cfg_max_wheel_speed_ms);
         out[13] = cfg_right_motor_reversed;
         out[14] = cfg_swap_left_right_motors;
-        write_f32_le(&out[15], cfg_motor_min_duty);
+        out[36] = cfg_left_motor_reversed;
+        write_f32_le(&out[15], cfg_motor_min_duty_left);
         write_f32_le(&out[19], cfg_motor_kick_duty);
         out[23] = cfg_motor_kick_cycles;
         write_f32_le(&out[24], cfg_motor_trim_left);
         write_f32_le(&out[28], cfg_motor_trim_right);
-        out_len = 32u;
+        write_f32_le(&out[32], cfg_motor_min_duty_right);
+        out_len = 37u;
     } else if (subcmd == CALIB_CMD_RESET) {
         reset_calibration_defaults();
     } else if (subcmd == CALIB_CMD_SAVE) {
@@ -1001,9 +1046,12 @@ static void set_motor(uint slice, bool reversed, float throttle, int motor_idx) 
     // Dead-zone compensation: boost small non-zero throttle to the minimum
     // duty needed to overcome the motor's static friction.  This maps the
     // input range [0.001, 1.0] → [MOTOR_MIN_DUTY, 1.0] linearly.
+    // Per-motor values compensate for manufacturing asymmetry.
+    float min_duty = (motor_idx == 0) ? cfg_motor_min_duty_left
+                                      : cfg_motor_min_duty_right;
     float mag = fabsf(throttle);
-    if (mag > 0.001f && cfg_motor_min_duty > 0.0f) {
-        mag = cfg_motor_min_duty + mag * (1.0f - cfg_motor_min_duty);
+    if (mag > 0.001f && min_duty > 0.0f) {
+        mag = min_duty + mag * (1.0f - min_duty);
         if (mag > 1.0f) mag = 1.0f;
     }
 
@@ -1222,6 +1270,106 @@ static float read_vsys(void) {
 }
 
 static bool  vbatt_low_alerted = false;  // latch so warning plays only once
+
+// ============================================================
+// GROVE ULTRASONIC RANGER V2.0 — single-wire trigger/echo
+// ============================================================
+//
+// Two sensors on Grove 2 (GP2) and Grove 3 (GP4), both front-facing.
+// Protocol: SIG pin is shared for trigger (output) and echo (input).
+//   1. Drive SIG HIGH for ≥10 µs, then LOW
+//   2. Switch SIG to input
+//   3. Wait for echo HIGH edge (sensor processing delay ~200 µs)
+//   4. Measure the HIGH pulse width (echo time)
+//   5. distance_mm = pulse_µs × 10 / 58  (speed of sound ≈ 343 m/s at 20 °C)
+//
+// Effective range: 20–3500 mm.  Resolution ≈ 1 mm.
+// Maximum blocking time per read ≈ 20 ms (timeout at ~3.4 m).
+// Sensors are staggered across alternate update_sensors() ticks (20 Hz)
+// so each fires at ~10 Hz, well above the 4 Hz minimum cycle time.
+// Ultrasonic polling is off by default; enable via ADDR_USS_ENABLE.
+
+#define USS_TRIGGER_US     10u       // Trigger pulse width (µs)
+#define USS_TIMEOUT_US     20000u    // Max echo wait (µs) ≈ 3.4 m round-trip
+#define USS_MIN_MM         20u       // Below this is unreliable
+#define USS_MAX_MM         3500u     // Sensor max rated range
+#define USS_INVALID        0xFFFFu   // Sentinel: no valid reading
+
+// Read one Grove Ultrasonic V2.0 sensor.
+// Returns distance in millimetres, or USS_INVALID on timeout/out-of-range.
+// Blocking: up to USS_TIMEOUT_US (~20 ms) per call.
+static uint16_t grove_ultrasonic_read_mm(uint pin) {
+    // --- Trigger pulse ---
+    gpio_set_dir(pin, GPIO_OUT);
+    gpio_put(pin, 1);
+    sleep_us(USS_TRIGGER_US);
+    gpio_put(pin, 0);
+
+    // --- Switch to input for echo ---
+    gpio_set_dir(pin, GPIO_IN);
+
+    // Wait for echo line to go HIGH (sensor asserts echo start)
+    uint64_t t0 = time_us_64();
+    while (!gpio_get(pin)) {
+        if (time_us_64() - t0 > USS_TIMEOUT_US) return USS_INVALID;
+    }
+
+    // Measure HIGH pulse duration (echo)
+    uint64_t pulse_start = time_us_64();
+    while (gpio_get(pin)) {
+        if (time_us_64() - pulse_start > USS_TIMEOUT_US) return USS_INVALID;
+    }
+    uint64_t pulse_us = time_us_64() - pulse_start;
+
+    // Convert to millimetres (speed of sound ≈ 343 m/s, round-trip)
+    uint32_t dist_mm = (uint32_t)(pulse_us * 10u / 58u);
+    if (dist_mm < USS_MIN_MM || dist_mm > USS_MAX_MM) return USS_INVALID;
+    return (uint16_t)dist_mm;
+}
+
+// Initialise the ultrasonic sensor GPIO pins (start as inputs, pulled low).
+static void init_ultrasonic(void) {
+    gpio_init(PIN_USS_1);
+    gpio_set_dir(PIN_USS_1, GPIO_IN);
+    gpio_pull_down(PIN_USS_1);
+
+    gpio_init(PIN_USS_2);
+    gpio_set_dir(PIN_USS_2, GPIO_IN);
+    gpio_pull_down(PIN_USS_2);
+}
+
+// Stagger counter — read one sensor per update_sensors() tick (alternating).
+static uint8_t uss_tick = 0;
+
+// Called from update_sensors().  Only active when ADDR_USS_ENABLE ≠ 0.
+static void update_ultrasonic(void) {
+    uint8_t en = regs[ADDR_USS_ENABLE];
+    if (!en) return;                 // ultrasonic disabled — zero overhead
+
+    uss_tick++;
+
+    // Sensor 1: fire on even ticks
+    if ((en & 0x01u) && (uss_tick & 1u) == 0u) {
+        uint16_t d = grove_ultrasonic_read_mm(PIN_USS_1);
+        w_u16(ADDR_USS_1_DIST_MM, d);
+        if (d == USS_INVALID) {
+            regs[ADDR_USS_STATUS] = (regs[ADDR_USS_STATUS] & ~0x01u) | 0x10u;
+        } else {
+            regs[ADDR_USS_STATUS] = (regs[ADDR_USS_STATUS] & ~0x10u) | 0x01u;
+        }
+    }
+
+    // Sensor 2: fire on odd ticks
+    if ((en & 0x02u) && (uss_tick & 1u) == 1u) {
+        uint16_t d = grove_ultrasonic_read_mm(PIN_USS_2);
+        w_u16(ADDR_USS_2_DIST_MM, d);
+        if (d == USS_INVALID) {
+            regs[ADDR_USS_STATUS] = (regs[ADDR_USS_STATUS] & ~0x02u) | 0x20u;
+        } else {
+            regs[ADDR_USS_STATUS] = (regs[ADDR_USS_STATUS] & ~0x20u) | 0x02u;
+        }
+    }
+}
 
 // ============================================================
 // BNO085 IMU  (SHTP over I2C on Grove 1 port)
@@ -1725,9 +1873,9 @@ static void update_odometry(float dt) {
         thr_r = (v_right / cfg_max_wheel_speed_ms) * cfg_motor_trim_right;
         if (cfg_swap_left_right_motors) {
             set_motor(pwm_slice_m1, cfg_right_motor_reversed != 0u, thr_r, 1);
-            set_motor(pwm_slice_m2, false,               thr_l, 0);
+            set_motor(pwm_slice_m2, cfg_left_motor_reversed  != 0u, thr_l, 0);
         } else {
-            set_motor(pwm_slice_m1, false,               thr_l, 0);
+            set_motor(pwm_slice_m1, cfg_left_motor_reversed  != 0u, thr_l, 0);
             set_motor(pwm_slice_m2, cfg_right_motor_reversed != 0u, thr_r, 1);
         }
         // LED feedback: on while motors are actively driven
@@ -1752,14 +1900,14 @@ static void update_odometry(float dt) {
         float raw_l = fabsf(v_left  / cfg_max_wheel_speed_ms);
         float raw_r = fabsf(v_right / cfg_max_wheel_speed_ms);
         if (raw_l > 0.001f) {
-            float eff_l = (cfg_motor_min_duty > 0.0f)
-                          ? cfg_motor_min_duty + raw_l * (1.0f - cfg_motor_min_duty)
+            float eff_l = (cfg_motor_min_duty_left > 0.0f)
+                          ? cfg_motor_min_duty_left + raw_l * (1.0f - cfg_motor_min_duty_left)
                           : raw_l;
             eff_v_left  = (v_left  >= 0.0f ? 1.0f : -1.0f) * eff_l * cfg_max_wheel_speed_ms;
         }
         if (raw_r > 0.001f) {
-            float eff_r = (cfg_motor_min_duty > 0.0f)
-                          ? cfg_motor_min_duty + raw_r * (1.0f - cfg_motor_min_duty)
+            float eff_r = (cfg_motor_min_duty_right > 0.0f)
+                          ? cfg_motor_min_duty_right + raw_r * (1.0f - cfg_motor_min_duty_right)
                           : raw_r;
             eff_v_right = (v_right >= 0.0f ? 1.0f : -1.0f) * eff_r * cfg_max_wheel_speed_ms;
         }
@@ -1898,6 +2046,9 @@ static void update_sensors(uint64_t now_us) {
     if (bno085_present) {
         bno085_update();
     }
+
+    // Ultrasonic sensors — only runs when ADDR_USS_ENABLE ≠ 0.
+    update_ultrasonic();
 }
 
 // ============================================================
@@ -1948,6 +2099,7 @@ int main(void) {
     init_ups_gpio();
     init_buzzer();
     init_adc();
+    init_ultrasonic();
 
     // Onboard LED for motor-activity feedback
     gpio_init(PIN_LED);
