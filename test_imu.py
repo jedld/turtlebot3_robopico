@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-test_imu.py — BNO085 IMU verification test (static, no motor movement)
+test_imu.py — IMU verification test (static, no motor movement)
 
 Subscribes to /imu and /magnetic_field, collects samples for ~5 seconds, then
 reports:
-  - Whether the data looks like the real BNO085 or the simulated fallback
+    - Whether the data looks like a real hardware IMU or the simulated fallback
   - Orientation (roll / pitch / yaw in degrees)
   - Linear acceleration vector and magnitude (should be ~9.81 m/s²)
   - Angular velocity (should be near-zero but with small sensor noise)
@@ -16,7 +16,7 @@ Detection heuristics for real vs. simulated IMU:
     orientation  = identity quaternion  (w=1, x=y=z=0, constant)
     linear_accel = (0, 0, 9.81)        (constant)
     angular_vel  = (0, 0, 0)           (constant)
-  Real BNO085 will show small sensor noise on all axes and the gravity
+    Real hardware IMU will show small sensor noise on all axes and the gravity
   vector may deviate slightly from pure +Z depending on how the board
   is mounted.
 
@@ -146,8 +146,8 @@ def analyse(imu_samples, mag_samples):
         print(f"  {'Mag field (T)':<20s}  x={mx:+.2e}  y={my:+.2e}  z={mz:+.2e}  T")
         print(f"  {'|field| magnitude':<20s}  {mag_ut:.2f} µT  (expected 25–65 µT on Earth)")
         if mag_ut < 1.0:
-            fail(f"Mag field is ~0 µT — BNO085 magnetometer not reporting data.  "
-                 f"Check report ID / firmware.")
+            fail(f"Mag field is ~0 µT — magnetometer not reporting data.  "
+                 f"Check IMU wiring and firmware init mode.")
             results_ok = False
         elif 25.0 <= mag_ut <= 65.0:
             ok(f"|mag| = {mag_ut:.2f} µT is within Earth's typical field range (25–65 µT).")
@@ -155,7 +155,7 @@ def analyse(imu_samples, mag_samples):
             warn(f"|mag| = {mag_ut:.2f} µT is outside typical Earth range (25–65 µT) — "
                  f"check for magnetic interference or mount location.")
     else:
-        fail("/magnetic_field not published — BNO085 mag may not be initialised.")
+        fail("/magnetic_field not published — IMU magnetometer may not be initialised.")
         results_ok = False
 
     # ── Variance analysis (real vs simulated) ─────────────────────────────────
@@ -178,7 +178,7 @@ def analyse(imu_samples, mag_samples):
     sd_ax    = stdev(acc_x)
 
     # The simulated IMU is perfectly constant — std-dev will be exactly 0.
-    # A real BNO085 will always show tiny noise even when stationary.
+    # A real hardware IMU will always show tiny noise even when stationary.
     NOISE_THRESHOLD = 1e-6
 
     is_real = (sd_qw > NOISE_THRESHOLD or
@@ -191,10 +191,10 @@ def analyse(imu_samples, mag_samples):
     print()
 
     if is_real:
-        ok("IMU data shows sensor noise — BNO085 hardware is ACTIVE (not simulated).")
+           ok("IMU data shows sensor noise — hardware IMU is ACTIVE (not simulated).")
     else:
         fail("IMU data is perfectly constant — firmware is using the SIMULATED fallback."
-             "  Check I2C wiring and I2C address (SA0 → GND for 0x4A).")
+               "  Check Grove 2 wiring (GP2/GP3) and IMU I2C address (BNO055: 0x28/0x29).")
         results_ok = False
 
     # Extra checks: gyro and rotation vector frozen suggests cargo-parser bug.
@@ -284,7 +284,7 @@ def analyse(imu_samples, mag_samples):
 def main():
     print()
     print(f"{BLD}{'='*60}{NC}")
-    print(f"{BLD}  BNO085 IMU Test  (Grove 1 / I2C0 / GP0=SDA / GP1=SCL){NC}")
+    print(f"{BLD}  IMU Test  (Grove 2 / I2C1 / GP2=SDA / GP3=SCL){NC}")
     print(f"{BLD}{'='*60}{NC}")
 
     rclpy.init()
@@ -299,7 +299,7 @@ def main():
 
     print()
     if passed:
-        print(f"{GRN}{BLD}All checks passed — BNO085 is connected and working.{NC}")
+        print(f"{GRN}{BLD}All checks passed — hardware IMU is connected and working.{NC}")
         sys.exit(0)
     else:
         print(f"{RED}{BLD}One or more checks FAILED — see output above.{NC}")

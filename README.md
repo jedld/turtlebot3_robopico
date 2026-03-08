@@ -92,6 +92,27 @@ ls -l /dev/ttyACM*
 # Expect: /dev/ttyACM0  (Dynamixel data port)
 ```
 
+## Grove Ultrasonic (Grove 2 + Grove 3)
+
+The firmware supports two Grove Ultrasonic Ranger V2.0 modules on:
+
+- Grove 2 SIG (yellow) → GP2 (`USS1`)
+- Grove 3 SIG (yellow) → GP4 (`USS2`)
+
+Use the helper script to validate both sensors:
+
+```bash
+python3 test_ultrasonic.py
+```
+
+The Dynamixel control table exposes:
+
+- `184` (`USS_ENABLE`), `185` (`USS_STATUS`)
+- `186` (`USS_1_DIST_MM`), `188` (`USS_2_DIST_MM`)
+
+For host compatibility, the nearest valid ultrasonic reading is also mirrored to
+legacy sonar register `38` (`float`, meters).
+
 ---
 
 ## ROS 2 configuration

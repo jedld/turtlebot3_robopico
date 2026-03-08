@@ -1,0 +1,18 @@
+[Unit]
+Description=Dual Ultrasonic ROS2 Publisher (Raspberry Pi GPIO)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jedld
+WorkingDirectory=/home/jedld/turtlebot3_robopico
+Environment=PYTHONUNBUFFERED=1
+Environment=ROS_DOMAIN_ID=42
+Environment=RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ExecStart=/bin/bash -lc 'source /opt/ros/rolling/setup.bash && source /home/jedld/turtlebot3_ws/install/setup.bash && python3 /home/jedld/turtlebot3_robopico/pi_ultrasonic_dual_ros2.py --left-gpio 23 --right-gpio 24 --rate 8.0 --inter-sensor-gap 0.05'
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

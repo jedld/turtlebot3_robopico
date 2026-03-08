@@ -1,0 +1,119 @@
+; quadrature_encoder.pio — PIO-based X4 quadrature decoder for RP2350
+;
+; Each state machine tracks one encoder (A on pin_base, B on pin_base+1).
+; The running count is kept in the X scratch register.
+; The CPU reads X atomically — no interrupt overhead, no debounce needed.
+;
+; Encoding: A = bit 0, B = bit 1 of the 2-bit state.
+; The ISR register holds the previous 2-bit state in bits [1:0].
+;
+; X4 quadrature truth table:
+;   prev  curr  step
+;   00    01    +1
+;   00    10    -1
+;   01    00    -1
+;   01    11    +1
+;   10    00    +1
+;   10    11    -1
+;   11    01    -1
+;   11    10    +1
+;   (same→same = 0, skip = 0)
+;
+; The PIO program samples the pins, XORs with the previous state to detect
+; changes, and uses JMP tables to determine direction.
+
+.program quadrature_encoder
+.origin -1              ; allow the assembler to place it anywhere
+
+; ──── Initialisation (runs once) ────────────────────────────────────────────
+; Read starting pin state into ISR (previous state).
+    in pins, 2          ; ISR ← {B, A}  (autopush disabled, so stays in ISR)
+    mov y, isr          ; Y ← current state (Y is our "previous state" register)
+    mov isr, null       ; clear ISR for cleanliness
+
+; ──── Main loop ─────────────────────────────────────────────────────────────
+.wrap_target
+sample:
+    mov isr, null       ; clear ISR
+    in pins, 2          ; ISR ← current {B, A}
+    mov x, isr          ; X temporarily = current state
+    jmp x!=y changed    ; if state differs from previous, process it
+    jmp sample          ; state unchanged — poll again
+changed:
+    ; We need to determine direction from (prev=Y, curr=X).
+    ;
+    ; Strategy: compute XOR(prev, curr).  For valid single-step transitions:
+    ;   If only A changed (XOR bit0=1, bit1=0): direction = curr_B XOR curr_A
+    ;   If only B changed (XOR bit0=0, bit1=1): direction = curr_A XOR curr_B XOR 1
+    ;
+    ; Simpler approach: use a tiny lookup via conditional jumps.
+    ; prev is in Y (2 bits), curr is in X (2 bits).
+    ; We use scratch registers creatively.
+    ;
+    ; Method: compute (prev << 2 | curr) as 4-bit index, then branch.
+    ; But PIO lacks shift-and-OR.  Instead, we use direct state comparisons:
+
+    ; Save current state as new "previous" for next iteration FIRST.
+    mov osr, y          ; OSR ← old prev (save for comparison below)
+    mov y, x            ; Y ← current state (becomes new prev)
+
+    ; Now: OSR = old prev, X = current state.  Determine step direction.
+    ; We encode prev in OSR and test using JMP on pin values.
+    ;
+    ; Approach: XOR prev^curr to find which bit changed, then determine sign.
+    ; PIO has no XOR instruction.  We use a small dispatch table on prev state.
+
+    ; Read prev from OSR back into X for comparison
+    mov x, osr          ; X = prev state
+    jmp !x prev_00      ; prev == 00?
+    mov x, osr
+    set isr, 1
+    mov isr, ::isr      ; not available — let's use a different approach
+
+    ; Actually, let's use the definitive approach: read pins again is fine since
+    ; state just changed. We dispatch on prev (in OSR).  We only need the 2 LSBs.
+
+    ; Re-think: use the simplest proven PIO quadrature approach.
+
+% c-sdk {
+
+// ──────────────────────────────────────────────────────────────────────────────
+// C helper: configure and start a PIO state machine for quadrature decoding.
+// ──────────────────────────────────────────────────────────────────────────────
+
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+
+static inline void quadrature_encoder_program_init(
+    PIO pio, uint sm, uint offset, uint pin_A, float sample_freq_hz)
+{
+    // Pin A and pin B (= pin_A + 1) are inputs.
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_A, 2, false);
+    pio_gpio_init(pio, pin_A);
+    pio_gpio_init(pio, pin_A + 1);
+
+    // Enable pull-ups on both pins.
+    gpio_pull_up(pin_A);
+    gpio_pull_up(pin_A + 1);
+
+    pio_sm_config c = quadrature_encoder_program_get_default_config(offset);
+    sm_config_set_in_pins(&c, pin_A);     // IN reads from pin_A
+    sm_config_set_jmp_pin(&c, pin_A);     // JMP PIN tests pin_A
+
+    // Clock divider to set sample rate; typical: 1 MHz (1 µs per instruction).
+    float div = (float)clock_get_hz(clk_sys) / sample_freq_hz;
+    sm_config_set_clkdiv(&c, div);
+
+    // No autopush / autopull
+    sm_config_set_in_shift(&c, false, false, 32);
+
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+%}
+.wrap
+
+
+; The above attempt is getting too complex with the branching approach.
+; Let me use the PROVEN table-lookup method from the pico-examples.

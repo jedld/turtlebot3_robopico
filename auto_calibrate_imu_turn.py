@@ -51,11 +51,19 @@ combined:
      independent angular estimate that is used to validate the FFT result and
      to further refine the final answer.
 
-  3. Kalman-style weighted fusion
+  3. Wheel-encoder odometry
+     Differential arc displacement from /joint_states:
+       θ_enc = (ΔR − ΔL) × r_wheel / wheel_separation
+     Independent of the IMU; biased when wheel_separation is wrong but
+     convergence is visible as enc/imu agreement improves across runs.
+       σ_encoder   ≈ 2.0°  (dominated by wheel_sep error at start)
+
+  4. Kalman-style weighted fusion
      Each sensor contributes with a weight proportional to 1/σ²:
        σ_lidar_fft ≈ 0.3°  (sub-pixel interpolated)
        σ_lidar_svd ≈ 0.4°
        σ_imu       ≈ 1.5°  (gyro drift over the measurement window)
+       σ_encoder   ≈ 2.0°  (wheel odometry, improves as sep converges)
      Fused estimate = Σ(w_i · θ_i) / Σ(w_i)
 
 Usage
@@ -90,6 +98,7 @@ import sys
 import termios
 import time
 import tty
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple, Optional
 
@@ -100,7 +109,7 @@ import rclpy
 from geometry_msgs.msg import Twist
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from sensor_msgs.msg import Imu, LaserScan
+from sensor_msgs.msg import Imu, JointState, LaserScan
 
 
 SCRIPT_DIR   = Path(__file__).resolve().parent
@@ -186,6 +195,10 @@ REAL_IMU_GYRO_VAR_THRESHOLD = 1e-5   # rad^2/s^2
 SIGMA_IMU       = 1.5   # gyro drift + integration error
 SIGMA_LIDAR_FFT = 0.30  # FFT + sub-pixel interpolation
 SIGMA_LIDAR_SVD = 0.40  # SVD Procrustes alignment
+SIGMA_ENCODER   = 2.0   # wheel-encoder odometry; error dominated by wheel_sep bias
+
+# Physical wheel parameters (must match firmware WHEEL_RADIUS_DEFAULT)
+WHEEL_RADIUS = 0.033   # metres — Cytron 65×26.5 mm wheel (32.5 mm physical radius)
 
 # Outlier detection — ratio of measured/target angle
 MIN_ANGLE_RATIO = 0.30   # <30% of target → likely a motor didn't move
@@ -205,6 +218,19 @@ MAX_CORRECTION_PER_STEP = 0.40   # ±40% per run
 # Reasonable range for WHEEL_SEPARATION in metres
 MIN_REASONABLE_SEP = 0.05   # 5 cm
 MAX_REASONABLE_SEP = 0.40   # 40 cm
+
+# ── Slip / friction detection ────────────────────────────────────────────────
+# Slip ratio = |enc_angle - imu_angle| / |imu_angle|
+SLIP_RATIO_GOOD     = 0.10   # <10% — negligible slip, good traction
+SLIP_RATIO_WARN     = 0.25   # 10-25% — some slip, surface may be marginal
+SLIP_RATIO_CRITICAL = 0.50   # >50% — severe slip, wheels losing traction badly
+
+# Encoder sign agreement: during pure rotation ΔL and ΔR should have opposite
+# signs.  If they have the same sign, the encoder wires are likely swapped.
+ENC_SIGN_AGREE_THRESHOLD = 0.1  # min fraction of target angle for check to apply
+
+# Multi-speed defaults (rad/s) for --multi-speed sweep
+MULTI_SPEED_DEFAULTS = [0.20, 0.35, 0.50]
 
 
 
@@ -394,6 +420,7 @@ def fuse_estimates(
     fft_quality: float,
     svd_rad: Optional[float],
     svd_inlier: float,
+    enc_rad: Optional[float],
     mode: str,
 ) -> tuple[float, str]:
     """
@@ -417,6 +444,10 @@ def fuse_estimates(
         sigma_svd = max(sigma_svd, 0.15)
         estimates.append((svd_rad, f"LiDAR-SVD(inlier={svd_inlier:.0%})", sigma_svd))
 
+    # Encoder-based odometry: include in all non-lidar-only modes
+    if enc_rad is not None and mode in ("imu", "fused"):
+        estimates.append((enc_rad, "ENC", SIGMA_ENCODER))
+
     if not estimates:
         raise ValueError("No estimates available for fusion")
 
@@ -429,6 +460,140 @@ def fuse_estimates(
         for w, (ang, lbl, _) in zip(weights, estimates)
     ]
     return fused, " | ".join(parts)
+
+
+# ── slip / friction analysis ──────────────────────────────────────────────────
+
+@dataclass
+class RunResult:
+    """Per-run measurement data for post-hoc analysis."""
+    speed: float             # commanded angular speed (rad/s)
+    target_deg: float        # target angle (degrees)
+    measured_deg: float      # fused measured angle (degrees)
+    imu_deg: float | None    # IMU-only angle (degrees)
+    enc_deg: float | None    # encoder-only angle (degrees)
+    enc_delta_l_deg: float   # raw ΔL from encoders (degrees)
+    enc_delta_r_deg: float   # raw ΔR from encoders (degrees)
+    slip_ratio: float | None # |enc - imu| / |imu|, None if unavailable
+    enc_signs_ok: bool | None  # True if ΔL and ΔR have opposite signs during rotation
+
+
+def compute_slip_ratio(
+    imu_deg: float | None,
+    enc_deg: float | None,
+) -> float | None:
+    """Return slip ratio = |enc - imu| / |imu|, or None if data unavailable."""
+    if imu_deg is None or enc_deg is None:
+        return None
+    imu_abs = abs(imu_deg)
+    if imu_abs < 5.0:
+        return None  # too small to compute meaningful ratio
+    return abs(abs(enc_deg) - imu_abs) / imu_abs
+
+
+def check_encoder_signs(delta_l_deg: float, delta_r_deg: float,
+                        target_deg: float) -> bool | None:
+    """Check that ΔL and ΔR have opposite signs during a rotation.
+
+    For a differential-drive robot rotating in place:
+    - CW rotation: left wheel forward (+), right wheel backward (-)
+    - CCW rotation: left wheel backward (-), right wheel forward (+)
+
+    Returns True if signs are correct (opposite), False if they're the same
+    (likely swapped encoders), None if magnitudes are too small to judge.
+    """
+    min_mag = abs(target_deg) * ENC_SIGN_AGREE_THRESHOLD
+    if abs(delta_l_deg) < min_mag and abs(delta_r_deg) < min_mag:
+        return None  # too little motion to judge
+    if abs(delta_l_deg) < min_mag or abs(delta_r_deg) < min_mag:
+        return None  # one wheel barely moved
+    # During rotation, the signs should be opposite
+    return (delta_l_deg > 0) != (delta_r_deg > 0)
+
+
+def print_slip_report(runs: list[RunResult]) -> None:
+    """Print a comprehensive slip / friction / encoder health report."""
+    if not runs:
+        return
+
+    print("\n" + "=" * 72)
+    print("SLIP & FRICTION ANALYSIS")
+    print("=" * 72)
+
+    # ── Per-run table ─────────────────────────────────────────────────────
+    print(f"\n  {'Run':>3s}  {'Speed':>6s}  {'IMU':>7s}  {'Enc':>7s}  "
+          f"{'Slip':>6s}  {'ΔL':>8s}  {'ΔR':>8s}  {'Signs':>6s}")
+    print("  " + "-" * 68)
+    for i, r in enumerate(runs, 1):
+        imu_s = f"{r.imu_deg:.1f}°" if r.imu_deg is not None else "  N/A"
+        enc_s = f"{r.enc_deg:.1f}°" if r.enc_deg is not None else "  N/A"
+        slip_s = f"{r.slip_ratio:.0%}" if r.slip_ratio is not None else " N/A"
+        sign_s = ("OK" if r.enc_signs_ok else "SWAP") if r.enc_signs_ok is not None else "N/A"
+        print(f"  {i:3d}  {r.speed:5.2f}  {imu_s:>7s}  {enc_s:>7s}  "
+              f"{slip_s:>6s}  {r.enc_delta_l_deg:+7.1f}°  {r.enc_delta_r_deg:+7.1f}°  {sign_s:>6s}")
+
+    # ── Encoder sign analysis ─────────────────────────────────────────────
+    sign_checks = [r.enc_signs_ok for r in runs if r.enc_signs_ok is not None]
+    if sign_checks:
+        bad_sign = sum(1 for s in sign_checks if not s)
+        if bad_sign > 0:
+            print(f"\n  ✖  ENCODER WIRING: {bad_sign}/{len(sign_checks)} runs show "
+                  f"ΔL and ΔR with the SAME sign during rotation.")
+            print("     This means the left and right encoder cables are SWAPPED.")
+            print("     → Swap the Grove encoder cables (Grove 3 ↔ Grove 4) and retest.")
+            print("     No amount of calibration will fix this — it must be fixed physically.")
+        else:
+            print(f"\n  ✓  Encoder wiring: ΔL and ΔR signs are correct in all {len(sign_checks)} run(s).")
+
+    # ── Slip analysis ─────────────────────────────────────────────────────
+    slip_values = [r.slip_ratio for r in runs if r.slip_ratio is not None]
+    if slip_values:
+        avg_slip = sum(slip_values) / len(slip_values)
+        max_slip = max(slip_values)
+
+        print(f"\n  Avg slip ratio    : {avg_slip:.1%}")
+        print(f"  Max slip ratio    : {max_slip:.1%}")
+
+        if avg_slip < SLIP_RATIO_GOOD:
+            print("  ✓  Traction is good — minimal wheel slip detected.")
+        elif avg_slip < SLIP_RATIO_WARN:
+            print("  ⚠  Moderate slip detected.")
+            print("     → The surface may be slightly slippery (tile, polished wood).")
+            print("     → Consider adding rubber bands to wheels for extra grip.")
+            print("     → Calibration accuracy may be affected by ±5-10%.")
+        elif avg_slip < SLIP_RATIO_CRITICAL:
+            print("  ⚠  Significant slip — wheels are losing traction.")
+            print("     → Surface friction is insufficient for reliable rotation.")
+            print("     → Try: textured surface, rubber wheel covers, or reduce speed.")
+            print("     → Calibrating on this surface will not transfer to other surfaces.")
+        else:
+            print("  ✖  Severe slip — wheels are spinning with very poor traction.")
+            print("     → Calibration on this surface is unreliable.")
+            print("     → Move the robot to a high-friction surface (carpet, rubber mat).")
+            print("     → Also check: wheels mounted correctly? Tires worn out?")
+
+        # Speed-vs-slip correlation
+        if len(set(r.speed for r in runs)) > 1:
+            speeds_seen = sorted(set(r.speed for r in runs))
+            print(f"\n  Speed vs. slip:")
+            for spd in speeds_seen:
+                spd_runs = [r for r in runs if r.speed == spd and r.slip_ratio is not None]
+                if spd_runs:
+                    avg_s = sum(r.slip_ratio for r in spd_runs) / len(spd_runs)
+                    label = ("good" if avg_s < SLIP_RATIO_GOOD
+                             else "moderate" if avg_s < SLIP_RATIO_WARN
+                             else "high" if avg_s < SLIP_RATIO_CRITICAL
+                             else "severe")
+                    print(f"    {spd:.2f} rad/s : avg slip {avg_s:.1%}  ({label})")
+            # Recommend best speed
+            best_speed = min(speeds_seen,
+                             key=lambda s: sum(r.slip_ratio or 999
+                                               for r in runs if r.speed == s))
+            print(f"    → Best tested speed: {best_speed:.2f} rad/s")
+    else:
+        print("\n  Slip analysis unavailable (no encoder + IMU data pairs).")
+
+    print()
 
 
 # ─── ROS node ─────────────────────────────────────────────────────────────────
@@ -507,19 +672,32 @@ def interactive_test(node: "TurnCalibrator", port: str, speed: float,
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
                 print(f"\r\n  Executing {target_deg:.0f}° test turn ... ", end="", flush=True)
 
-                # Reset integrator and do the turn
+                # Reset IMU integrator and encoder accumulators
                 node.cum_yaw = 0.0
                 node._last_imu_stamp = None
-                node.collecting = True
+                node._enc_delta_left  = 0.0
+                node._enc_delta_right = 0.0
+                node._enc_left_pos    = None
+                node._enc_right_pos   = None
+                node.collecting      = True
+                node._enc_collecting = True
                 duration = abs(target_rad / speed)
                 end_t = time.time() + duration
                 while time.time() < end_t:
                     node.send(0.0, speed)
                     rclpy.spin_once(node, timeout_sec=0.05)
-                node.collecting = False
+                node.collecting      = False
+                node._enc_collecting = False
                 node.stop(1.0)
                 measured_rad = abs(node.cum_yaw)
                 measured_deg_val = math.degrees(measured_rad)
+
+                # Encoder cross-check
+                if node._joints_ok and sep > 0.001:
+                    enc_arc_L = node._enc_delta_left  * WHEEL_RADIUS
+                    enc_arc_R = node._enc_delta_right * WHEEL_RADIUS
+                    enc_deg   = math.degrees(abs((enc_arc_R - enc_arc_L) / sep))
+                    print(f"enc={enc_deg:.2f}°  ", end="", flush=True)
                 error_deg = measured_deg_val - target_deg
 
                 if measured_rad > math.radians(5):
@@ -649,7 +827,17 @@ class TurnCalibrator(Node):
         self._gyro_samples: list[float] = []
         self._gyro_collecting = False
 
+        # ── Wheel-encoder accumulator ──────────────────────────────────────
+        self._joints_ok       = False
+        self._enc_collecting  = False
+        self._enc_left_pos:  Optional[float] = None   # last known wheel position (rad)
+        self._enc_right_pos: Optional[float] = None
+        self._enc_delta_left  = 0.0   # accumulated displacement this measurement
+        self._enc_delta_right = 0.0
+
         self.create_subscription(Imu, "/imu", self._imu_cb, 30)
+        self.create_subscription(JointState, "/joint_states",
+                                 self._joint_cb, 30)
 
         # LiDAR publishes with BEST_EFFORT (YDLidar driver default).
         # A RELIABLE subscription silently receives nothing — match the publisher.
@@ -688,6 +876,30 @@ class TurnCalibrator(Node):
                     self.cum_yaw += msg.angular_velocity.z * dt
             self._last_imu_stamp = stamp
 
+    def _joint_cb(self, msg: JointState):
+        """Accumulate wheel arc displacements (rad) while _enc_collecting is True."""
+        self._joints_ok = True
+        try:
+            li = msg.name.index("wheel_left_joint")
+            ri = msg.name.index("wheel_right_joint")
+        except ValueError:
+            return
+        l_pos = msg.position[li]
+        r_pos = msg.position[ri]
+        if self._enc_collecting:
+            if self._enc_left_pos is not None:
+                dl = l_pos - self._enc_left_pos
+                dr = r_pos - self._enc_right_pos
+                # Wrap per-tick deltas to ±π to survive position roll-over
+                while dl >  math.pi: dl -= 2.0 * math.pi
+                while dl < -math.pi: dl += 2.0 * math.pi
+                while dr >  math.pi: dr -= 2.0 * math.pi
+                while dr < -math.pi: dr += 2.0 * math.pi
+                self._enc_delta_left  += dl
+                self._enc_delta_right += dr
+            self._enc_left_pos  = l_pos
+            self._enc_right_pos = r_pos
+
     def _scan_cb(self, msg: LaserScan):
         self._latest_scan = msg
         self._scan_received = True
@@ -722,6 +934,14 @@ class TurnCalibrator(Node):
         while time.time() < end:
             rclpy.spin_once(self, timeout_sec=0.05)
             if self._scan_received:
+                return True
+        return False
+
+    def wait_for_joints(self, timeout: float = 5.0) -> bool:
+        end = time.time() + timeout
+        while time.time() < end:
+            rclpy.spin_once(self, timeout_sec=0.05)
+            if self._joints_ok:
                 return True
         return False
 
@@ -777,6 +997,7 @@ class TurnCalibrator(Node):
         real_imu: bool,
         fusion_mode: str,
         safety_cutoff_rad: float | None = None,
+        enc_wheel_sep: float | None = None,
     ) -> tuple[float, str]:
         """
         Execute one rotation and return (measured_angle_rad, detail_string).
@@ -788,18 +1009,21 @@ class TurnCalibrator(Node):
 
         Pipeline:
           1. Capture pre-rotation scan (if LiDAR enabled).
-          2. Rotate (closed-loop on IMU, or fixed-duration fallback).
+          2. Rotate (closed-loop on IMU, or fixed-duration fallback);
+             simultaneously accumulate wheel-encoder arc displacements.
           3. Capture post-rotation scan.
           4. FFT polar cross-correlation → coarse angle.
           5. SVD Procrustes refinement with FFT seed → fine angle.
           6. Detect 360° LiDAR aliasing (complement ambiguity).
-          7. Kalman-style weighted fusion with IMU.
+          7. Compute encoder-odometry angle: (ΔR−ΔL)×r/sep.
+          8. Kalman-style weighted fusion: IMU + encoder + LiDAR.
         """
         imu_angle: Optional[float] = None
         fft_angle: Optional[float] = None
         fft_quality = 0.0
         svd_angle: Optional[float] = None
         svd_inlier = 0.0
+        enc_angle: Optional[float] = None
 
         # Capture reference scan before rotation
         scan_before: Optional[LaserScan] = None
@@ -808,6 +1032,13 @@ class TurnCalibrator(Node):
             if scan_before is None:
                 print("  Warning: no LiDAR scan available — falling back to IMU only.")
                 use_lidar = False
+
+        # Reset encoder accumulators for this measurement window
+        self._enc_delta_left  = 0.0
+        self._enc_delta_right = 0.0
+        self._enc_left_pos    = None
+        self._enc_right_pos   = None
+        self._enc_collecting  = True
 
         # Execute rotation + collect IMU
         # ---------- closed-loop (IMU-guided) rotation ----------
@@ -839,7 +1070,8 @@ class TurnCalibrator(Node):
                         and abs(self.cum_yaw) >= safety_cutoff_rad):
                     safety_triggered = True
                     break
-        self.collecting = False
+        self.collecting      = False
+        self._enc_collecting = False
         self.stop(settle=0.6)
         elapsed = time.time() - start_t
         if closed_loop_stop:
@@ -862,6 +1094,28 @@ class TurnCalibrator(Node):
                       f"which is >3× target {math.degrees(abs(target_rad)):.1f}° "
                       "— discarding IMU for this run.")
                 imu_angle = None
+
+        # ── Encoder-odometry angle ─────────────────────────────────────────
+        if self._joints_ok and enc_wheel_sep and enc_wheel_sep > 0.001:
+            arc_L = self._enc_delta_left  * WHEEL_RADIUS
+            arc_R = self._enc_delta_right * WHEEL_RADIUS
+            enc_angle_raw = (arc_R - arc_L) / enc_wheel_sep
+            sign = math.copysign(1.0, imu_angle if imu_angle is not None else speed)
+            enc_angle = math.copysign(abs(enc_angle_raw), sign)
+            if abs(enc_angle) > 3.0 * abs(target_rad):
+                print(f"  Warning: encoder measured {math.degrees(abs(enc_angle)):.1f}°"
+                      f" > 3× target — discarding encoder for this run.")
+                enc_angle = None
+            else:
+                slip_deg = None
+                if imu_angle is not None:
+                    slip_deg = math.degrees(abs(enc_angle) - abs(imu_angle))
+                slip_str = (f"  slip={slip_deg:+.2f}°"
+                            if slip_deg is not None else "")
+                print(f"  Encoder  : {math.degrees(abs(enc_angle if enc_angle else 0)):.2f}°"
+                      f"  (ΔL={math.degrees(self._enc_delta_left):+.1f}°"
+                      f"  ΔR={math.degrees(self._enc_delta_right):+.1f}°"
+                      f"{slip_str})")
 
         # Capture post-rotation scan
         if use_lidar:
@@ -921,7 +1175,8 @@ class TurnCalibrator(Node):
 
         # Weighted fusion
         fused, detail = fuse_estimates(
-            imu_angle, fft_angle, fft_quality, svd_angle, svd_inlier, mode=fusion_mode
+            imu_angle, fft_angle, fft_quality, svd_angle, svd_inlier,
+            enc_angle, mode=fusion_mode
         )
         return fused, detail
 
@@ -962,10 +1217,26 @@ def main():
                         help="per-run retry limit for outlier runs where a motor "
                              "stalled or the robot over-rotated "
                              f"(default: {DEFAULT_MAX_RETRIES})")
+    parser.add_argument("--multi-speed", action="store_true",
+                        help="test at multiple speeds (0.20, 0.35, 0.50 rad/s) "
+                             "to detect speed-dependent slip; uses --runs per speed")
+    parser.add_argument("--speeds", type=str, default=None, metavar="S1,S2,...",
+                        help="comma-separated list of speeds for multi-speed sweep "
+                             "(e.g. '0.15,0.30,0.50'); implies --multi-speed")
     args = parser.parse_args()
 
     if args.flash:
         print("NOTE: --flash is deprecated. Runtime calibration is applied live; no reflashing needed.")
+
+    # Parse multi-speed options
+    speed_list: list[float] | None = None
+    if args.speeds:
+        args.multi_speed = True
+        speed_list = [float(s.strip()) for s in args.speeds.split(",") if s.strip()]
+    if args.multi_speed and speed_list is None:
+        speed_list = list(MULTI_SPEED_DEFAULTS)
+    if speed_list:
+        speed_list = sorted(speed_list)
 
     # ── Hard reset: bypass measurement entirely ───────────────────────────────
     if args.reset is not None:
@@ -1044,6 +1315,13 @@ def main():
     real_imu = node.detect_real_imu(speed=min(args.speed, 0.5), duration=1.5)
     print()
 
+    # Probe wheel-encoder availability
+    print("Waiting for /joint_states ...", end=" ", flush=True)
+    if node.wait_for_joints(timeout=5.0):
+        print("OK  (encoder fusion enabled)")
+    else:
+        print("not available — encoder fusion disabled.")
+
     # Probe LiDAR availability
     if use_lidar:
         print(f"Waiting for LiDAR on {args.scan_topic} ...", end=" ", flush=True)
@@ -1067,6 +1345,7 @@ def main():
         print("LiDAR unavailable — switching fusion mode to 'imu'.\n")
 
     measurements: list[float] = []
+    run_results: list[RunResult] = []
     sep_history: list[float] = [runtime_sep]
 
     # Read motor kick/min-duty defaults from the source so we can restore later
@@ -1103,12 +1382,30 @@ def main():
 
         # ── Automatic measurement (IMU and/or LiDAR) ─────────────────────
         discarded_runs = 0
-        effective_speed = args.speed
-        for i in range(args.runs):
+
+        # Build the list of (speed, run_index) pairs.  When --multi-speed is
+        # active we iterate over each speed in speed_list, running args.runs
+        # per speed.  Otherwise we just use args.speed for all runs.
+        if speed_list:
+            speed_schedule = [
+                (spd, ri)
+                for spd in speed_list
+                for ri in range(args.runs)
+            ]
+            total_runs = len(speed_schedule)
+            print(f"Multi-speed sweep: {len(speed_list)} speed(s) × {args.runs} run(s) = {total_runs} total\n")
+        else:
+            speed_schedule = [(args.speed, ri) for ri in range(args.runs)]
+            total_runs = args.runs
+
+        run_counter = 0
+        for sched_speed, run_idx in speed_schedule:
+            run_counter += 1
+            effective_speed = sched_speed
             accepted = False
             for attempt in range(1, args.max_retries + 1):
                 suffix = f" (attempt {attempt})" if attempt > 1 else ""
-                print(f"Run {i+1}/{args.runs}{suffix} — rotating {args.angle:.0f} deg "
+                print(f"Run {run_counter}/{total_runs}{suffix} — rotating {args.angle:.0f} deg "
                       f"at {effective_speed:.2f} rad/s ...")
                 measured, detail = node.measure_rotation_fused(
                     speed=effective_speed,
@@ -1117,6 +1414,7 @@ def main():
                     real_imu=real_imu,
                     fusion_mode=fusion_mode,
                     safety_cutoff_rad=safety_cutoff if real_imu else None,
+                    enc_wheel_sep=runtime_sep,
                 )
                 abs_measured = abs(measured)
                 ratio = abs_measured / target_rad if target_rad > 0 else 0.0
@@ -1158,6 +1456,32 @@ def main():
                       f"desired={args.angle:.1f}°  ratio={target_rad/abs_measured:.4f}")
                 print(f"  Detail   : {detail}")
 
+                # ── collect RunResult for slip / friction analysis ─────────
+                run_imu_deg: float | None = None
+                run_enc_deg: float | None = None
+                if real_imu and node.cum_yaw is not None:
+                    run_imu_deg = math.degrees(abs(node.cum_yaw))
+                enc_dl_deg = math.degrees(node._enc_delta_left)
+                enc_dr_deg = math.degrees(node._enc_delta_right)
+                if node._joints_ok and runtime_sep > 0.001:
+                    arc_L = node._enc_delta_left  * WHEEL_RADIUS
+                    arc_R = node._enc_delta_right * WHEEL_RADIUS
+                    run_enc_deg = math.degrees(abs((arc_R - arc_L) / runtime_sep))
+
+                rr = RunResult(
+                    speed=effective_speed,
+                    target_deg=args.angle,
+                    measured_deg=math.degrees(abs_measured),
+                    imu_deg=run_imu_deg,
+                    enc_deg=run_enc_deg,
+                    enc_delta_l_deg=enc_dl_deg,
+                    enc_delta_r_deg=enc_dr_deg,
+                    slip_ratio=compute_slip_ratio(run_imu_deg, run_enc_deg),
+                    enc_signs_ok=check_encoder_signs(enc_dl_deg, enc_dr_deg,
+                                                     args.angle),
+                )
+                run_results.append(rr)
+
                 # Iterative runtime update for the next run.
                 # Clamp raw correction to avoid divergent leaps from one bad
                 # measurement (e.g. 10° measured → 18× multiplier).
@@ -1182,7 +1506,7 @@ def main():
 
             if not accepted:
                 discarded_runs += 1
-            if i < args.runs - 1:
+            if run_counter < total_runs:
                 time.sleep(0.8)
 
         if discarded_runs:
@@ -1231,6 +1555,10 @@ def main():
                 time.sleep(0.8)
 
     node.stop(0.2)
+
+    # ── Slip / friction / encoder report ──────────────────────────────────
+    if run_results:
+        print_slip_report(run_results)
 
     if not measurements:
         node.destroy_node()

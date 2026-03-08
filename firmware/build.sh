@@ -75,12 +75,21 @@ do_build() {
     fi
 
     echo "=== Building firmware (target: pico2 / RP2350) ==="
+    # IMU_TYPE env var selects which IMU driver to compile in:
+    #   0 = AUTO (BNO085 → BNO055 → simulated)
+    #   1 = BNO085 only
+    #   2 (default) = BNO055 only
+    #   3 = SIMULATED only
+    # Usage: IMU_TYPE=2 ./build.sh flash
+    local imu_type="${IMU_TYPE:-2}"
+    echo "    IMU_TYPE=${imu_type}  (0=AUTO 1=BNO085 2=BNO055 3=SIMULATED)"
     mkdir -p "$BUILD_DIR"
     cmake -S "$FIRMWARE_DIR" -B "$BUILD_DIR" \
         -DPICO_BOARD=pico2 \
         -DPICO_SDK_PATH="$PICO_SDK_PATH" \
         -GNinja \
-        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_BUILD_TYPE=Release \
+        -DIMU_TYPE="${imu_type}"
     cmake --build "$BUILD_DIR" -- -j"$(nproc)"
 
     local uf2="$BUILD_DIR/turtlebot3_pico_fw.uf2"

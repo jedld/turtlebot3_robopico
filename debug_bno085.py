@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-debug_bno085.py — BNO085 init diagnostics via Dynamixel Protocol 2.0
+debug_bno085.py — IMU init diagnostics via Dynamixel Protocol 2.0
 
 Reads the debug registers written by the firmware at boot to report exactly
-why the BNO085 failed to initialise (or confirm it succeeded).
+why hardware IMU detection failed (or confirm it succeeded).
 
 IMPORTANT: Run this WITHOUT bringup active — the script needs exclusive access
 to the serial port.
@@ -13,8 +13,8 @@ Usage:
     python3 debug_bno085.py --raw      # also dump raw IMU register values
 
 Exit codes:
-    0  BNO085 detected and registers look healthy
-    1  BNO085 not detected (see output for reason)
+    0  hardware IMU detected and registers look healthy
+    1  hardware IMU not detected (see output for reason)
     2  Could not open serial port / read registers
 """
 
@@ -127,7 +127,7 @@ def main():
 
     print()
     print(f"{BLD}{'='*60}{NC}")
-    print(f"{BLD}  BNO085 Firmware Debug  ({args.port}){NC}")
+    print(f"{BLD}  IMU Firmware Debug  ({args.port}){NC}")
     print(f"{BLD}  Stop bringup before running this script{NC}")
     print(f"{BLD}{'='*60}{NC}")
     print()
@@ -174,15 +174,15 @@ def main():
         fail(f"BNO085 init code = {bno085_rc}  →  {rc_name}")
 
     print()
-    print(f"{BLD}── I2C0 Bus Scan (GP0=SDA / GP1=SCL) ───────────────────────{NC}")
-    info(f"Devices found on I2C0 during boot: {i2c0_ndev}")
+    print(f"{BLD}── IMU Bus Scan (Grove 2: GP2=SDA / GP3=SCL) ───────────────{NC}")
+    info(f"Devices found on IMU bus during boot: {i2c0_ndev}")
 
     if i2c0_ndev == 0:
-        fail("No I2C devices were detected on GP0/GP1 at all.  Check:")
+        fail("No I2C devices were detected on GP2/GP3 at all.  Check:")
         print("      1. STEMMA QT cable fully seated at both ends")
-        print("      2. Grove 1 port used (not Grove 2, 3 … )")
+        print("      2. Grove 2 port used (not Grove 1, 3 … )")
         print("      3. Cable not damaged / miswired")
-        print("      4. BNO085 VIN connected to 3.3V (red wire on Grove)")
+        print("      4. IMU VIN connected to 3.3V (red wire on Grove)")
     else:
         for addr in i2c0_devs:
             tag = ""
@@ -190,20 +190,19 @@ def main():
             elif addr == 0x4B: tag = "  ← BNO085 (SA0→VCC)"
             info(f"  0x{addr:02X} ({addr:3d}){tag}")
 
-        bno085_found_on_bus = any(a in (0x4A, 0x4B) for a in i2c0_devs)
-        if bno085_found_on_bus:
-            ok("BNO085 I2C address IS visible on the bus.")
+        imu_found_on_bus = any(a in (0x28, 0x29, 0x4A, 0x4B) for a in i2c0_devs)
+        if imu_found_on_bus:
+            ok("IMU I2C address is visible on the bus.")
             if bno085_rc != 0:
-                warn("Sensor is on the bus but SHTP timed out.  Possible causes:")
-                print("      • Power was applied too quickly (BNO085 needs >150 ms to boot)")
+                warn("Sensor is on the bus but BNO085 SHTP timed out.  Possible causes:")
+                print("      • Power was applied too quickly (BNO085 path needs >150 ms to boot)")
                 print("      • I2C pullups too weak (check 4.7 kΩ on SDA/SCL — Adafruit board has them)")
                 print("      • Sensor in a bad state — try a hard power cycle (not just reset)")
         else:
-            fail(f"BNO085 not found at 0x4A or 0x4B.  Found instead: "
+            fail(f"No known IMU address found (expected one of 0x28/0x29/0x4A/0x4B). Found: "
                  f"{[hex(a) for a in i2c0_devs]}")
-            print("      Verify SA0 pin connection — it determines the I2C address:")
-            print("      SA0 tied to GND → 0x4A   |   SA0 tied to VCC → 0x4B")
-            print("      (On the Adafruit board SA0 is the PS1 pad, default floating → 0x4A)")
+            print("      For BNO055, ADR determines 0x28 (GND) or 0x29 (VCC).")
+            print("      For BNO085, SA0 determines 0x4A (GND) or 0x4B (VCC).")
 
     # ── optional raw IMU dump ─────────────────────────────────────────────────
     if args.raw:
@@ -257,11 +256,11 @@ def main():
     ser.close()
     print()
 
-    if imu_source == 1:
-        print(f"{GRN}{BLD}BNO085 is initialised and active.{NC}")
+    if imu_source in (1, 2):
+        print(f"{GRN}{BLD}Hardware IMU is initialised and active ({IMU_SOURCE_NAMES.get(imu_source)}).{NC}")
         sys.exit(0)
     else:
-        print(f"{RED}{BLD}BNO085 NOT active — see failure details above.{NC}")
+        print(f"{RED}{BLD}Hardware IMU NOT active — see failure details above.{NC}")
         sys.exit(1)
 
 

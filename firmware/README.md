@@ -44,6 +44,8 @@ the first PING in **< 10 ms** from any point after USB enumeration.
 | Button 2 | GP21 | active-low, internal pull-up |
 | Buzzer | GP22 | variable-frequency PWM |
 | Onboard LED | GP25 | motor-activity indicator |
+| Ultrasonic 1 (Grove 2 SIG) | GP2 | Grove Ultrasonic Ranger V2.0 single-wire SIG |
+| Ultrasonic 2 (Grove 3 SIG) | GP4 | Grove Ultrasonic Ranger V2.0 single-wire SIG |
 | Battery ADC | GP28 | Vbatt via 2:1 divider (solder pad) |
 | VSYS monitor | GP29 | VSYS via 3:1 resistor divider |
 
@@ -110,6 +112,7 @@ conventions used by `turtlebot3_node/control_table.hpp`.
 | 18 | DEVICE_STATUS | uint8 | `0` = OK |
 | 26 | BUTTON_1 | uint8 | `1` when pressed |
 | 27 | BUTTON_2 | uint8 | `1` when pressed |
+| 38 | SONAR | float32 | legacy single sonar value in meters (nearest valid USS1/USS2) |
 | 42 | BATTERY_VOLTAGE | int32 | millivolts × 10 (e.g. 400 = 4.00 V) |
 | 46 | BATTERY_PERCENT | int32 | percent × 100 (e.g. 8000 = 80.00%) |
 | 50 | SOUND | uint8 | note index 0–10; write to play, auto-clears on next sensor tick |
@@ -136,6 +139,10 @@ conventions used by `turtlebot3_node/control_table.hpp`.
 | 149 | MOTOR_TORQUE_ENABLE | uint8 | `1` = motors driven; `0` = coast/brake |
 | 150 | CMD_LINEAR_X | int32 | **0.01 m/s units** (e.g. 10 = 0.10 m/s) |
 | 170 | CMD_ANGULAR_Z | int32 | **0.01 rad/s units** (e.g. -157 = -1.57 rad/s) |
+| 184 | USS_ENABLE | uint8 | bit0=enable USS1 (Grove2), bit1=enable USS2 (Grove3) |
+| 185 | USS_STATUS | uint8 | bit0/1 valid, bit4/5 timeout for USS1/USS2 |
+| 186 | USS_1_DIST_MM | uint16 | USS1 distance in mm, `0xFFFF` = timeout/invalid |
+| 188 | USS_2_DIST_MM | uint16 | USS2 distance in mm, `0xFFFF` = timeout/invalid |
 
 > **Addresses 152–169 and 170+ are offset from turtlebot3_node defaults.**
 > If the robot does not respond to velocity commands, cross-check

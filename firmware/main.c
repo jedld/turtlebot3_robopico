@@ -30,8 +30,10 @@
  *                  High = mains disconnected (robot running on battery)
  *   UPS LBAT     : GP27 = Grove 6, pin 2 (White)  — X-UPS1 Low Battery signal
  *                  High = battery ≤ 3 V per cell (pack ≤ 12 V); cut-off imminent
- *   Ultrasonic 1 : GP2  = Grove 2, pin 1 (Yellow) — Grove Ultrasonic Ranger V2.0
- *   Ultrasonic 2 : GP4  = Grove 3, pin 1 (Yellow) — Grove Ultrasonic Ranger V2.0
+ *   Encoder L A  : GP16 = Grove 4, pin 1 (Yellow)  — observed left wheel ENC_A
+ *   Encoder L B  : GP17 = Grove 4, pin 2 (White)   — observed left wheel ENC_B
+ *   Encoder R A  : GP4  = Grove 3, pin 1 (Yellow)  — observed right wheel ENC_A
+ *   Encoder R B  : GP5  = Grove 3, pin 2 (White)   — observed right wheel ENC_B
  *
  * Register map: control_table.hpp in turtlebot3_node
  */
@@ -46,6 +48,7 @@
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 #include "hardware/watchdog.h"
+#include "hardware/irq.h"
 #include "pico/bootrom.h"
 #include "bsp/board.h"
 #include "tusb.h"
@@ -75,11 +78,16 @@
 #define PIN_UPS_PLD   26u     // GP26 = Grove 6, pin 1 (Yellow) — Power Loss Detect
 #define PIN_UPS_LBAT  27u     // GP27 = Grove 6, pin 2 (White)  — Low Battery
 
-// Grove Ultrasonic Ranger V2.0 — single SIG pin per sensor.
-// Both sensors are front-facing for distance calibration.
-#define PIN_USS_1     2u      // GP2 = Grove 2, pin 1 (Yellow) — Ultrasonic sensor 1
-#define PIN_USS_2     4u      // GP4 = Grove 3, pin 1 (Yellow) — Ultrasonic sensor 2
-
+// DFRobot FIT0450 TT Motor with Encoder (120:1, 8 PPR motor shaft) — quadrature.
+// Signals pass through a TXS0108E 8-ch bidirectional level shifter (3.3 V ↔ 5 V).
+// Grove connector pin 1 (Yellow) → FIT0450 Blue  wire = ENC_A (channel A)
+// Grove connector pin 2 (White)  → FIT0450 Green wire = ENC_B (channel B)
+// Encoder VCC = 5 V (via level-shifter HV rail), GND = Black.
+// Pull-ups enabled on 3.3 V side (Pico GPIO internal pull-ups are sufficient post-shifter).
+#define PIN_ENC_L_A   16u     // GP16 = Grove 4, pin 1 (Yellow/Blue)  — Left  encoder channel A
+#define PIN_ENC_L_B   17u     // GP17 = Grove 4, pin 2 (White/Green) — Left  encoder channel B
+#define PIN_ENC_R_A   4u      // GP4 = Grove 3, pin 1 (Yellow/Blue)  — Right encoder channel A
+#define PIN_ENC_R_B   5u      // GP5 = Grove 3, pin 2 (White/Green) — Right encoder channel B
 
 // Pico 2 system clock — use the SDK-defined SYS_CLK_HZ (150 MHz for RP2350).
 // Do not redefine; it comes from hardware/platform_defs.h.
@@ -107,14 +115,14 @@
 //   turtlebot3_bringup/param/humble/burger.yaml
 // ============================================================
 
-#define WHEEL_RADIUS_DEFAULT        0.361910f  // metres — calibrated (723.8 mm diam. effective)
+#define WHEEL_RADIUS_DEFAULT        0.033000f  // metres — Cytron 65 mm wheel physical radius
 // ANGULAR CALIBRATION: do NOT use a scale factor (it breaks odometry).
 // Tune WHEEL_SEPARATION to match effective turning base; run auto_calibrate_imu_turn.py.
-#define WHEEL_SEPARATION_DEFAULT    0.127735f  // metres — effective turning base; calibrated by auto_calibrate_imu_turn.py
-#define MAX_WHEEL_SPEED_MS_DEFAULT  2.000000f  // calibrated — straight_calibrate.py
-#define LEFT_MOTOR_REVERSED_DEFAULT  1       // set to 1 if left wheel spins backward
-#define RIGHT_MOTOR_REVERSED_DEFAULT 1       // set to 1 if right wheel spins backward
-#define SWAP_LEFT_RIGHT_MOTORS_DEFAULT 1      // set to 1 if M1/M2 are physically wired to opposite sides
+#define WHEEL_SEPARATION_DEFAULT    0.121642f  // metres — effective turning base; calibrated by auto_calibrate_imu_turn.py
+#define MAX_WHEEL_SPEED_MS_DEFAULT  0.550000f  // m/s — FIT0450 @6V no-load ≈160RPM×π×0.065
+#define LEFT_MOTOR_REVERSED_DEFAULT  0       // CHAN_A = physical forward for left motor
+#define RIGHT_MOTOR_REVERSED_DEFAULT 1       // CHAN_B = physical forward for right motor
+#define SWAP_LEFT_RIGHT_MOTORS_DEFAULT 0      // motors physically swapped: left→M1, right→M2
 
 // Minimum duty cycle (dead-zone compensation).
 // DFRobot FIT0450 TT Motor with Encoder (6V 160RPM 120:1) — higher gear
@@ -123,23 +131,78 @@
 // Any non-zero throttle is boosted to at least this value.
 // Set to 0.0f to disable.  Range: 0.0 – 1.0.
 // Re-run calibrate_deadzone.py if motors stall or overshoot.
-#define MOTOR_MIN_DUTY_LEFT_DEFAULT   0.50f  // calibrated — calibrate_deadzone.py
-#define MOTOR_MIN_DUTY_RIGHT_DEFAULT  0.36f  // calibrated — calibrate_deadzone.py
+#define MOTOR_MIN_DUTY_LEFT_DEFAULT   0.15f  // calibrated — calibrate_deadzone.py
+#define MOTOR_MIN_DUTY_RIGHT_DEFAULT  0.15f  // calibrated — calibrate_deadzone.py
 
 // Kick-start: when a motor transitions from stopped to moving (or reverses
 // direction), apply KICK_DUTY for KICK_CYCLES odometry cycles to overcome
 // static friction, then settle to normal (dead-zone compensated) duty.
 // Particularly important for pivot turns where individual wheel velocities
 // are very small.  Set KICK_CYCLES to 0 to disable.
-#define MOTOR_KICK_DUTY_DEFAULT     0.55f  // calibrated — calibrate_deadzone.py
+#define MOTOR_KICK_DUTY_DEFAULT     0.20f  // calibrated — calibrate_deadzone.py
 #define MOTOR_KICK_CYCLES_DEFAULT   3u  // calibrated — calibrate_deadzone.py
 
 // Per-motor throttle trim — compensates for manufacturing differences between
 // the left and right motors that cause the robot to drift sideways.
 // Range: 0.80 – 1.20.  Keep the faster motor at 1.0 and reduce the other.
 // These are computed automatically by turtlebot3_pico/straight_calibrate.py.
-#define MOTOR_TRIM_LEFT_DEFAULT    1.000000f  // calibrated — straight_calibrate.py
-#define MOTOR_TRIM_RIGHT_DEFAULT   0.700000f  // calibrated — straight_calibrate.py
+#define MOTOR_TRIM_LEFT_DEFAULT    1.000000f  // kept for feedforward use; PID handles asymmetry
+#define MOTOR_TRIM_RIGHT_DEFAULT   1.000000f  // both 1.0 — closed-loop PID corrects drift
+
+// ============================================================
+// ENCODER-BASED VELOCITY PID
+// ============================================================
+// DFRobot FIT0450 encoder: 8 PPR motor shaft, X4 quadrature decoding, 120:1 gearbox.
+// Total counts per wheel revolution: 8 × 4 × 120 = 3840.
+#define ENC_PPR_MOTOR           8u      // pulses per motor shaft revolution
+#define ENC_GEAR_RATIO          120u    // gearbox reduction ratio
+// Counts per full wheel revolution (X4 quadrature)
+#define ENC_COUNTS_PER_WHEEL_REV  ((float)(ENC_PPR_MOTOR * 4u * ENC_GEAR_RATIO))  // 3840.0
+// Radians of wheel rotation per raw encoder count
+#define ENC_RAD_PER_COUNT  (2.0f * 3.14159265358979f / ENC_COUNTS_PER_WHEEL_REV)
+
+// Velocity PID — incremental (velocity) form matching TurtleBot3 OpenCR behaviour.
+// Each cycle: delta_output = Kp*(err - prev_err) + Ki*err*dt
+//             output      += delta_output   (naturally bounded; no windup)
+// Gains are in throttle [−1,1] per (m/s) error units.
+// Default values match OpenCR Kp=0.45, Ki=0.6 (duty 0–255 @ ≈160RPM max)
+// translated to [0,1] duty @ 0.55 m/s max.
+#define PID_KP_DEFAULT   1.5f   // proportional to Δerror
+#define PID_KI_DEFAULT   8.0f   // integral: raised for fast convergence (~0.5 s to target)
+#define PID_KD_DEFAULT   0.0f   // derivative (typically 0 for velocity PID)
+#define PID_OUTPUT_MAX   1.0f   // clamp on PID output accumulator
+
+// Heading-hold: encoder-based straight-line correction.
+// When ang_z ≈ 0 and lin_x ≠ 0, a PI controller on the encoder differential
+// (L−R distance / wheel_separation) keeps the robot driving straight.
+// Uses encoder feedback instead of gyro to avoid BNO055 vibration-rectification bias.
+// Units: rad/s angular velocity correction per radian heading error.
+#define HEADING_HOLD_KP_DEFAULT   4.0f
+#define HEADING_HOLD_KI_DEFAULT   1.0f   // integral gain ─ eliminates steady-state drift
+// Ignore heading errors below this threshold to avoid micro-oscillations.
+#define HEADING_HOLD_DEADBAND     0.003f  // rad ≈ 0.17°
+// Maximum angular correction the heading-hold can inject (rad/s).
+#define HEADING_HOLD_MAX_CORR     1.0f
+// Anti-windup clamp for the integral accumulator (rad·s).
+#define HEADING_HOLD_I_MAX        0.5f
+
+// Encoder differential trim — equalises left/right wheel distance during
+// straight-line driving.  Complements the gyro heading hold with direct
+// encoder feedback so that asymmetric motors/encoders/tire diameters are
+// automatically compensated.
+// Units: (m/s trim) per (metre of accumulated L−R wheel distance error).
+#define ENC_TRIM_KP_DEFAULT       1.0f
+// Maximum per-wheel velocity trim the encoder correction can inject (m/s).
+#define ENC_TRIM_MAX_CORR         0.05f
+
+// Velocity slew-rate (ramp) limiter — applied to the PID setpoint each 50 Hz cycle.
+// Limits the rate of change of the commanded wheel velocity to prevent wheel slip
+// and match TurtleBot3 OpenCR trapezoidal velocity profile behaviour.
+// Units: m/s per second (i.e. m/s²).
+// At the 50 Hz update rate, max step per cycle = VEL_RAMP / 50.
+// Default 1.5 m/s²: ramps from 0 to max (0.55 m/s) in ~0.37 s.
+// Set to 0.0 to disable (instantaneous — pre-ramp behaviour).
+#define VEL_RAMP_DEFAULT  1.5f  // m/s²
 
 // Dynamixel position tick: ~0.001534 rad/tick (4096 ticks/rev)
 #define TICK_TO_RAD     0.001533981f
@@ -171,7 +234,7 @@ static inline float rpm_per_ms(void) {
 }
 
 #define CALIB_FLASH_MAGIC   0x43414C31u  // "CAL1"
-#define CALIB_FLASH_VERSION 2u
+#define CALIB_FLASH_VERSION 11u // bumped: left_motor_reversed 1→0, encoder sign fixes
 #define CALIB_FLASH_OFFSET  (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
 
 typedef struct {
@@ -319,10 +382,10 @@ static bool load_calibration_from_flash(void) {
 #define SENSOR_INTERVAL_US  50000u  // 20 Hz
 
 // ============================================================
-// CONTROL TABLE  (256-byte register map)
+// CONTROL TABLE  (register map — must be large enough for all defined ADDR_* + their width)
 // ============================================================
 
-#define REG_SIZE 256u
+#define REG_SIZE 276u
 static uint8_t regs[REG_SIZE];
 
 // --- typed register accessors --------------------------------
@@ -370,6 +433,7 @@ static inline void w_f32(uint addr, float v) {
 #define ADDR_DEVICE_STATUS      18u
 #define ADDR_BUTTON_1           26u
 #define ADDR_BUTTON_2           27u
+#define ADDR_SONAR              38u
 #define ADDR_BATTERY_VOLTAGE    42u
 #define ADDR_BATTERY_PERCENT    46u
 #define ADDR_SOUND              50u
@@ -408,7 +472,7 @@ static inline void w_f32(uint addr, float v) {
 // Debug — IMU init diagnostics (read-only, addresses 174–183)
 // These are written once at boot and remain constant; read via Dynamixel or
 // the debug_bno085.py script when bringup is NOT running.
-#define ADDR_DBG_IMU_SOURCE     174u  // 1 byte: 0=simulated 1=BNO085
+#define ADDR_DBG_IMU_SOURCE     174u  // 1 byte: 0=simulated 1=BNO085 2=BNO055
 #define ADDR_DBG_BNO085_RC      175u  // 1 byte: BNO085 init result
                                       //   0 = init succeeded (BNO085 active)
                                       //   1 = SHTP timeout at 0x4A (no reply in 500 ms)
@@ -424,13 +488,55 @@ static inline void w_f32(uint addr, float v) {
 #define ADDR_DBG_I2C0_DEV5      182u
 #define ADDR_DBG_I2C0_DEV6      183u
 
-// Ultrasonic distance sensors — Grove Ultrasonic Ranger V2.0 (read-only + enable)
-// Write ADDR_USS_ENABLE to activate; readings update at ~10 Hz per sensor (staggered).
-#define ADDR_USS_ENABLE         184u  // 1 byte, write: bit 0 = USS1 en, bit 1 = USS2 en
-#define ADDR_USS_STATUS         185u  // 1 byte, read:  bit 0 = USS1 valid,  bit 1 = USS2 valid
-                                      //                bit 4 = USS1 timeout, bit 5 = USS2 timeout
-#define ADDR_USS_1_DIST_MM      186u  // uint16, read: sensor 1 distance in mm (0xFFFF = timeout)
-#define ADDR_USS_2_DIST_MM      188u  // uint16, read: sensor 2 distance in mm (0xFFFF = timeout)
+// Quadrature encoder counts — updated continuously via GPIO IRQ.
+// ADDR_ENC_RESET: write any non-zero value to atomically zero both counters.
+#define ADDR_ENC_L_COUNT  184u  // int32 — left  encoder tick count (X4 quadrature)
+#define ADDR_ENC_R_COUNT  188u  // int32 — right encoder tick count (X4 quadrature)
+#define ADDR_ENC_RESET    192u  // uint8 — write non-zero to reset both counters
+#define ADDR_ENC_IRQ_DBG  193u  // uint32 — debug: raw IRQ callback invocation count
+#define ADDR_ENC_GPIO_RAW 197u  // uint8  — debug: live GPIO states bit[0]=LA bit[1]=LB bit[2]=RA bit[3]=RB
+                               //         (increments on every edge of any encoder pin)
+
+// BNO055 calibration status (read-only, updated every sensor tick).
+// Same bit layout as BNO055 CALIB_STAT register (0x35):
+//   bits 7-6: SYS  (0=uncal … 3=fully cal)
+//   bits 5-4: GYR  (0=uncal … 3=fully cal)
+//   bits 3-2: ACC  (0=uncal … 3=fully cal)
+//   bits 1-0: MAG  (0=uncal … 3=fully cal)
+// 0xFF when BNO055 is not the active IMU.
+#define ADDR_DBG_BNO055_CALIB  198u
+
+// Velocity PID gains (read/write, float).  Write via Dynamixel to tune at runtime.
+// Saved values persist across reset only if written through dxl_calibration_cli.py.
+#define ADDR_PID_KP   200u   // float — proportional gain (default PID_KP_DEFAULT)
+#define ADDR_PID_KI   204u   // float — integral gain    (default PID_KI_DEFAULT)
+#define ADDR_PID_KD   208u   // float — derivative gain  (default PID_KD_DEFAULT)
+// Measured wheel velocities reported from encoder (read-only, float, updated at 50 Hz).
+#define ADDR_DBG_VEL_L  212u  // float — measured left  wheel velocity (m/s)
+#define ADDR_DBG_VEL_R  216u  // float — measured right wheel velocity (m/s)
+// Velocity slew-rate limit (read/write, float, m/s²).
+// Applied to the PID setpoint each cycle.  0.0 disables ramping.
+#define ADDR_VEL_RAMP   220u  // float — max wheel velocity change per second (m/s²)
+
+// Heading-hold (gyro-based straight-line correction)
+// When cmd_vel has lin_x ≠ 0 and ang_z ≈ 0, the firmware locks the current
+// gyro yaw and applies a proportional correction to keep the robot straight.
+#define ADDR_HEADING_HOLD_KP  240u  // float (read/write) — P gain for heading hold
+#define ADDR_DBG_HEADING_ERR  244u  // float (read-only)  — current heading error (rad)
+#define ADDR_HEADING_HOLD_EN  248u  // uint8 (read/write) — 1=enabled (default), 0=disabled
+#define ADDR_HEADING_HOLD_KI  252u  // float (read/write) — I gain for heading hold
+#define ADDR_HEADING_HOLD_CORR 256u // float (read-only)  — current ang_z correction (rad/s)
+
+// Encoder differential trim (straight-line wheel equalisation)
+#define ADDR_ENC_TRIM_KP   260u  // float (read/write) — gain for encoder trim
+#define ADDR_DBG_ENC_TRIM  264u  // float (read-only)  — current per-wheel trim (m/s)
+#define ADDR_DBG_ENC_DIFF  268u  // float (read-only)  — accumulated L−R distance diff (m)
+
+// Runtime diagnostics (read-only, addr 224–239)
+#define ADDR_DIAG_USB_TX_STALLS 224u  // uint32 — status packets dropped because USB TX stopped draining
+#define ADDR_DIAG_SENSOR_MAX_US 228u  // uint32 — worst-case update_sensors() runtime observed
+#define ADDR_DIAG_ODOM_MAX_US   232u  // uint32 — worst-case update_odometry() runtime observed
+#define ADDR_DIAG_LOOP_MAX_US   236u  // uint32 — worst-case main-loop iteration gap observed
 
 static void init_registers(void) {
     memset(regs, 0, REG_SIZE);
@@ -450,10 +556,40 @@ static void init_registers(void) {
     w_f32(ADDR_IMU_LIN_ACC_Y,    0.0f);
     w_f32(ADDR_IMU_LIN_ACC_Z,    IMU_GRAVITY_Z);
 
+    // BNO055 calibration register — 0xFF until BNO055 is confirmed active.
+    regs[ADDR_DBG_BNO055_CALIB] = 0xFFu;
+
+    // Velocity PID gains — loaded from flash if available, else use defaults.
+    w_f32(ADDR_PID_KP, PID_KP_DEFAULT);
+    w_f32(ADDR_PID_KI, PID_KI_DEFAULT);
+    w_f32(ADDR_PID_KD, PID_KD_DEFAULT);
+    w_f32(ADDR_DBG_VEL_L, 0.0f);
+    w_f32(ADDR_DBG_VEL_R, 0.0f);
+    w_f32(ADDR_VEL_RAMP, VEL_RAMP_DEFAULT);
+    w_i32(ADDR_DIAG_USB_TX_STALLS, 0);
+    w_i32(ADDR_DIAG_SENSOR_MAX_US, 0);
+    w_i32(ADDR_DIAG_ODOM_MAX_US, 0);
+    w_i32(ADDR_DIAG_LOOP_MAX_US, 0);
+
+    // Heading hold — TEMPORARILY DISABLED for PID debugging
+    w_f32(ADDR_HEADING_HOLD_KP, HEADING_HOLD_KP_DEFAULT);
+    w_f32(ADDR_HEADING_HOLD_KI, HEADING_HOLD_KI_DEFAULT);
+    w_f32(ADDR_DBG_HEADING_ERR, 0.0f);
+    w_f32(ADDR_HEADING_HOLD_CORR, 0.0f);
+    regs[ADDR_HEADING_HOLD_EN] = 0u;  // disabled for now
+
+    // Encoder differential trim — enabled by default (Kp > 0)
+    w_f32(ADDR_ENC_TRIM_KP, ENC_TRIM_KP_DEFAULT);
+    w_f32(ADDR_DBG_ENC_TRIM, 0.0f);
+    w_f32(ADDR_DBG_ENC_DIFF, 0.0f);
+
     // Battery initial placeholder — updated to real GPIO reading within first 50 ms.
     // Default to "on battery, mid-charge" (14.80 V, 50 %) until first sensor tick.
     w_i32(ADDR_BATTERY_VOLTAGE,  1480);
     w_i32(ADDR_BATTERY_PERCENT,  5000);
+
+    // Legacy sonar register — kept at 0 (sensors moved to Raspberry Pi).
+    w_f32(ADDR_SONAR, 0.0f);
 
     // Motor torque enabled by default
     regs[ADDR_MOTOR_TORQUE_EN] = 1;
@@ -463,6 +599,13 @@ static void init_registers(void) {
     regs[ADDR_DBG_BNO085_RC]  = 0xFFu;
     regs[ADDR_DBG_I2C0_NDEV]  = 0u;
     memset(&regs[ADDR_DBG_I2C0_DEV0], 0xFF, 7u);
+
+    // Encoder counters — start at zero
+    w_i32(ADDR_ENC_L_COUNT, 0);
+    w_i32(ADDR_ENC_R_COUNT, 0);
+    regs[ADDR_ENC_RESET] = 0u;
+    w_i32(ADDR_ENC_IRQ_DBG, 0);
+    regs[ADDR_ENC_GPIO_RAW] = 0u;
 }
 
 // ============================================================
@@ -745,11 +888,27 @@ static void handle_calibration(uint8_t dev_id, const uint8_t *params, uint16_t n
 // yet, tud_cdc_write returns < len.  We loop + tud_task to drain.
 static void send_packet(uint32_t len) {
     uint32_t sent = 0;
+    uint64_t start_us = time_us_64();
+    uint64_t last_progress_us = start_us;
     while (sent < len) {
         uint32_t n = tud_cdc_write(resp_buf + sent, len - sent);
         sent += n;
+        if (n > 0u) {
+            last_progress_us = time_us_64();
+        }
         tud_cdc_write_flush();
         if (sent < len) {
+            uint64_t now_us = time_us_64();
+            // If the host stops draining the CDC TX endpoint, tud_cdc_write()
+            // can keep returning 0 forever.  Do not hard-stall the firmware in
+            // that case — drop the response, count it, and return to the main loop.
+            if (!tud_cdc_connected()
+                || (now_us - last_progress_us) > 20000u
+                || (now_us - start_us) > 50000u) {
+                uint32_t stalls = (uint32_t)r_i32(ADDR_DIAG_USB_TX_STALLS);
+                w_i32(ADDR_DIAG_USB_TX_STALLS, (int32_t)(stalls + 1u));
+                break;
+            }
             tud_task();  // pump USB to drain TX FIFO
         }
     }
@@ -1272,104 +1431,116 @@ static float read_vsys(void) {
 static bool  vbatt_low_alerted = false;  // latch so warning plays only once
 
 // ============================================================
-// GROVE ULTRASONIC RANGER V2.0 — single-wire trigger/echo
+// QUADRATURE ENCODER — DFRobot FIT0450 (Grove 3 = left, Grove 4 = right)
 // ============================================================
 //
-// Two sensors on Grove 2 (GP2) and Grove 3 (GP4), both front-facing.
-// Protocol: SIG pin is shared for trigger (output) and echo (input).
-//   1. Drive SIG HIGH for ≥10 µs, then LOW
-//   2. Switch SIG to input
-//   3. Wait for echo HIGH edge (sensor processing delay ~200 µs)
-//   4. Measure the HIGH pulse width (echo time)
-//   5. distance_mm = pulse_µs × 10 / 58  (speed of sound ≈ 343 m/s at 20 °C)
+// X4 decoding: interrupt on every edge of both A and B channels.
+// At each edge: sample the other channel to determine direction.
 //
-// Effective range: 20–3500 mm.  Resolution ≈ 1 mm.
-// Maximum blocking time per read ≈ 20 ms (timeout at ~3.4 m).
-// Sensors are staggered across alternate update_sensors() ticks (20 Hz)
-// so each fires at ~10 Hz, well above the 4 Hz minimum cycle time.
-// Ultrasonic polling is off by default; enable via ADDR_USS_ENABLE.
+//   A rising  + B=0 → forward (+1)    A rising  + B=1 → reverse (−1)
+//   A falling + B=1 → forward (+1)    A falling + B=0 → reverse (−1)
+//   B rising  + A=1 → forward (+1)    B rising  + A=0 → reverse (−1)
+//   B falling + A=0 → forward (+1)    B falling + A=1 → reverse (−1)
+//
+// Motor spec: 8 PPR on motor shaft, 120:1 gearbox → 960 counts/output rev
+// X4:  3840 counts/output revolution.
 
-#define USS_TRIGGER_US     10u       // Trigger pulse width (µs)
-#define USS_TIMEOUT_US     20000u    // Max echo wait (µs) ≈ 3.4 m round-trip
-#define USS_MIN_MM         20u       // Below this is unreliable
-#define USS_MAX_MM         3500u     // Sensor max rated range
-#define USS_INVALID        0xFFFFu   // Sentinel: no valid reading
+static volatile int32_t enc_count_left  = 0;
+static volatile int32_t enc_count_right = 0;
+static volatile uint32_t enc_irq_dbg    = 0;  // raw IRQ fire counter (debug)
+static volatile uint8_t enc_prev_state_left  = 0;
+static volatile uint8_t enc_prev_state_right = 0;
 
-// Read one Grove Ultrasonic V2.0 sensor.
-// Returns distance in millimetres, or USS_INVALID on timeout/out-of-range.
-// Blocking: up to USS_TIMEOUT_US (~20 ms) per call.
-static uint16_t grove_ultrasonic_read_mm(uint pin) {
-    // --- Trigger pulse ---
-    gpio_set_dir(pin, GPIO_OUT);
-    gpio_put(pin, 1);
-    sleep_us(USS_TRIGGER_US);
-    gpio_put(pin, 0);
+// Per-pin debounce timestamps (microseconds).
+// FIT0450 max: 160 RPM output × 120:1 = 19200 RPM motor shaft, 8 PPR → ~5120 edges/s/channel.
+// Minimum valid half-period ≈ 195 µs.  We gate at 50 µs to reject TXS0108E glitch bursts
+// while still passing all real encoder transitions up to ~5× rated max speed.
+#define ENC_DEBOUNCE_US  50u
+static volatile uint32_t enc_last_us[4] = {0, 0, 0, 0};  // LA, LB, RA, RB
 
-    // --- Switch to input for echo ---
-    gpio_set_dir(pin, GPIO_IN);
+#define ENC_DIR_SIGN_LEFT   (1)
+#define ENC_DIR_SIGN_RIGHT  (1)
 
-    // Wait for echo line to go HIGH (sensor asserts echo start)
-    uint64_t t0 = time_us_64();
-    while (!gpio_get(pin)) {
-        if (time_us_64() - t0 > USS_TIMEOUT_US) return USS_INVALID;
-    }
-
-    // Measure HIGH pulse duration (echo)
-    uint64_t pulse_start = time_us_64();
-    while (gpio_get(pin)) {
-        if (time_us_64() - pulse_start > USS_TIMEOUT_US) return USS_INVALID;
-    }
-    uint64_t pulse_us = time_us_64() - pulse_start;
-
-    // Convert to millimetres (speed of sound ≈ 343 m/s, round-trip)
-    uint32_t dist_mm = (uint32_t)(pulse_us * 10u / 58u);
-    if (dist_mm < USS_MIN_MM || dist_mm > USS_MAX_MM) return USS_INVALID;
-    return (uint16_t)dist_mm;
+static inline int8_t quadrature_step(uint8_t prev_state, uint8_t curr_state) {
+    // Transition table for A=bit0, B=bit1. Invalid/skipped transitions return 0.
+    static const int8_t table[16] = {
+         0, +1, -1,  0,
+        -1,  0,  0, +1,
+        +1,  0,  0, -1,
+         0, -1, +1,  0,
+    };
+    return table[((prev_state & 0x3u) << 2) | (curr_state & 0x3u)];
 }
 
-// Initialise the ultrasonic sensor GPIO pins (start as inputs, pulled low).
-static void init_ultrasonic(void) {
-    gpio_init(PIN_USS_1);
-    gpio_set_dir(PIN_USS_1, GPIO_IN);
-    gpio_pull_down(PIN_USS_1);
+static void encoder_irq_callback(uint gpio, uint32_t events) {
+    enc_irq_dbg++;   // always increment so we can see if IRQ fires at all
 
-    gpio_init(PIN_USS_2);
-    gpio_set_dir(PIN_USS_2, GPIO_IN);
-    gpio_pull_down(PIN_USS_2);
-}
+    // Debounce: ignore edges that arrive faster than ENC_DEBOUNCE_US per pin.
+    uint idx;
+    if      (gpio == PIN_ENC_L_A) idx = 0;
+    else if (gpio == PIN_ENC_L_B) idx = 1;
+    else if (gpio == PIN_ENC_R_A) idx = 2;
+    else if (gpio == PIN_ENC_R_B) idx = 3;
+    else return;
 
-// Stagger counter — read one sensor per update_sensors() tick (alternating).
-static uint8_t uss_tick = 0;
+    uint32_t now = (uint32_t)time_us_32();
+    if ((now - enc_last_us[idx]) < ENC_DEBOUNCE_US) return;
+    enc_last_us[idx] = now;
 
-// Called from update_sensors().  Only active when ADDR_USS_ENABLE ≠ 0.
-static void update_ultrasonic(void) {
-    uint8_t en = regs[ADDR_USS_ENABLE];
-    if (!en) return;                 // ultrasonic disabled — zero overhead
-
-    uss_tick++;
-
-    // Sensor 1: fire on even ticks
-    if ((en & 0x01u) && (uss_tick & 1u) == 0u) {
-        uint16_t d = grove_ultrasonic_read_mm(PIN_USS_1);
-        w_u16(ADDR_USS_1_DIST_MM, d);
-        if (d == USS_INVALID) {
-            regs[ADDR_USS_STATUS] = (regs[ADDR_USS_STATUS] & ~0x01u) | 0x10u;
-        } else {
-            regs[ADDR_USS_STATUS] = (regs[ADDR_USS_STATUS] & ~0x10u) | 0x01u;
-        }
-    }
-
-    // Sensor 2: fire on odd ticks
-    if ((en & 0x02u) && (uss_tick & 1u) == 1u) {
-        uint16_t d = grove_ultrasonic_read_mm(PIN_USS_2);
-        w_u16(ADDR_USS_2_DIST_MM, d);
-        if (d == USS_INVALID) {
-            regs[ADDR_USS_STATUS] = (regs[ADDR_USS_STATUS] & ~0x02u) | 0x20u;
-        } else {
-            regs[ADDR_USS_STATUS] = (regs[ADDR_USS_STATUS] & ~0x20u) | 0x02u;
-        }
+    bool a, b;
+    if (gpio == PIN_ENC_L_A || gpio == PIN_ENC_L_B) {
+        a = gpio_get(PIN_ENC_L_A);
+        b = gpio_get(PIN_ENC_L_B);
+        uint8_t state = (uint8_t)((a ? 0x01u : 0u) | (b ? 0x02u : 0u));
+        int8_t step = quadrature_step(enc_prev_state_left, state);
+        enc_prev_state_left = state;
+        enc_count_left += (int32_t)(ENC_DIR_SIGN_LEFT * step);
+    } else {
+        a = gpio_get(PIN_ENC_R_A);
+        b = gpio_get(PIN_ENC_R_B);
+        uint8_t state = (uint8_t)((a ? 0x01u : 0u) | (b ? 0x02u : 0u));
+        int8_t step = quadrature_step(enc_prev_state_right, state);
+        enc_prev_state_right = state;
+        enc_count_right += (int32_t)(ENC_DIR_SIGN_RIGHT * step);
     }
 }
+
+static void init_encoders(void) {
+    // Configure all four encoder input pins with internal pull-ups.
+    gpio_init(PIN_ENC_L_A); gpio_set_dir(PIN_ENC_L_A, GPIO_IN); gpio_pull_up(PIN_ENC_L_A);
+    gpio_init(PIN_ENC_L_B); gpio_set_dir(PIN_ENC_L_B, GPIO_IN); gpio_pull_up(PIN_ENC_L_B);
+    gpio_init(PIN_ENC_R_A); gpio_set_dir(PIN_ENC_R_A, GPIO_IN); gpio_pull_up(PIN_ENC_R_A);
+    gpio_init(PIN_ENC_R_B); gpio_set_dir(PIN_ENC_R_B, GPIO_IN); gpio_pull_up(PIN_ENC_R_B);
+
+    enc_prev_state_left = (uint8_t)((gpio_get(PIN_ENC_L_A) ? 0x01u : 0u) |
+                                    (gpio_get(PIN_ENC_L_B) ? 0x02u : 0u));
+    enc_prev_state_right = (uint8_t)((gpio_get(PIN_ENC_R_A) ? 0x01u : 0u) |
+                                     (gpio_get(PIN_ENC_R_B) ? 0x02u : 0u));
+
+    // SDK 2.x: set the shared GPIO IRQ callback FIRST, then enable edges on
+    // each pin.  Using gpio_set_irq_callback() (not _with_callback()) ensures the
+    // callback is registered exactly once and cannot be overwritten by board_init().
+    gpio_set_irq_callback(encoder_irq_callback);
+    gpio_set_irq_enabled(PIN_ENC_L_A, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
+    gpio_set_irq_enabled(PIN_ENC_L_B, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
+    gpio_set_irq_enabled(PIN_ENC_R_A, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
+    gpio_set_irq_enabled(PIN_ENC_R_B, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
+    // Explicitly enable the GPIO bank-0 IRQ on this core so it can't be missed.
+    irq_set_enabled(IO_IRQ_BANK0, true);
+}
+
+// ============================================================
+// IMU type selection
+// ============================================================
+// Controlled by the IMU_TYPE compile-time flag (cmake -DIMU_TYPE=n):
+//   0 = AUTO      probe BNO085 first; fall back to BNO055; then simulated
+//   1 = BNO085    probe BNO085 only  (skip BNO055 init entirely)
+//   2 = BNO055    probe BNO055 only  (skip the long BNO085 SHTP drain, default)
+//   3 = SIMULATED no hardware IMU;   always use static simulated data
+// If the flag is not provided by the build system, BNO055-only is assumed.
+#ifndef IMU_TYPE
+#  define IMU_TYPE 2   /* 2=BNO055 */
+#endif
 
 // ============================================================
 // BNO085 IMU  (SHTP over I2C on Grove 1 port)
@@ -1391,7 +1562,11 @@ static void update_ultrasonic(void) {
 #define BNO085_I2C_PORT   i2c0
 #define BNO085_SDA_PIN    0u
 #define BNO085_SCL_PIN    1u
-#define BNO085_I2C_HZ     400000u
+#define BNO085_I2C_HZ     400000u  // BNO085 SHTP needs high speed
+// The BNO055 violates I2C in some circumstances and does not respond reliably
+// above ~100 kHz on RP2040/RP2350.  Adafruit's own library drops to 50 kHz on
+// RP2040; we use 100 kHz which is reliable and broadly documented.
+#define BNO055_I2C_HZ     100000u
 #define BNO085_ADDR       0x4Au   // SA0 = GND.  Change to 0x4B if SA0 = VCC.
 
 // SHTP channel numbers (host perspective)
@@ -1693,8 +1868,8 @@ static void i2c0_scan_and_record(void) {
     for (uint8_t addr = 0x08u; addr <= 0x77u && nfound < 7u; addr++) {
         // Skip BNO085 candidate addresses — already probed via SHTP.
         if (addr == 0x4Au || addr == 0x4Bu) {
-            // Record them as present only if bno085_runtime_addr matched.
-            if (addr == bno085_runtime_addr) {
+            // Record only when BNO085 is known present at that runtime address.
+            if (bno085_present && addr == bno085_runtime_addr) {
                 regs[ADDR_DBG_I2C0_DEV0 + nfound] = addr;
                 nfound++;
             }
@@ -1834,43 +2009,531 @@ static bool init_bno085(void) {
 
 
 // ============================================================
-// ODOMETRY  (dead-reckoning, open-loop, 50 Hz)
+// BNO055 IMU  (register I2C on Grove 1 port — fallback for BNO085)
+// ============================================================
+//
+// Same pins as BNO085: GP2=SDA, GP3=SCL (I2C1 at 400 kHz, already started
+// by init_bno085()).  Probed automatically when BNO085 is not detected.
+// Runs in NDOF 9-DoF fusion mode: quaternion, linear accel, gyro, mag.
+//
+// I2C addresses: 0x28 (ADR → GND, default) or 0x29 (ADR → VCC).
+
+#define BNO055_ADDR_0           0x28u
+#define BNO055_ADDR_1           0x29u
+
+#define BNO055_CHIP_ID_REG      0x00u   // Expected value: 0xA0
+#define BNO055_PAGE_ID_REG      0x07u
+#define BNO055_ACC_DATA_X_LSB   0x08u   // 6 bytes: X Y Z each int16, raw accel (gravity-inclusive)
+#define BNO055_MAG_DATA_X_LSB   0x0Eu   // 6 bytes: X Y Z each int16
+#define BNO055_GYR_DATA_X_LSB   0x14u   // 6 bytes: X Y Z each int16
+#define BNO055_QUA_DATA_W_LSB   0x20u   // 8 bytes: W X Y Z each int16 Q14
+#define BNO055_LIA_DATA_X_LSB   0x28u   // 6 bytes: X Y Z each int16, linear accel (gravity-subtracted)
+#define BNO055_CALIB_STAT_REG   0x35u   // bits[7:6]=SYS, [5:4]=GYR, [3:2]=ACC, [1:0]=MAG (0-3 each)
+#define BNO055_SYS_STATUS_REG   0x39u   // 0=idle,1=error,2=init periph,3=init sys,4=selftest,5=running fusion,6=running no-fusion
+#define BNO055_SYS_ERR_REG      0x3Au   // 0=none,1=periph init,2=sys init,3=selftest,4=reg val OOR,5=addr OOR,6=write err,7=lowLvl err
+#define BNO055_UNIT_SEL_REG     0x3Bu
+#define BNO055_OPR_MODE_REG     0x3Du
+#define BNO055_PWR_MODE_REG     0x3Eu
+#define BNO055_SYS_TRIGGER_REG  0x3Fu
+
+#define BNO055_CHIP_ID_VAL      0xA0u
+#define BNO055_OPR_CONFIG       0x00u   // CONFIG mode
+#define BNO055_OPR_IMUPLUS      0x08u   // IMU fusion (gyro + accel, no magnetometer)
+#define BNO055_OPR_NDOF         0x0Cu   // NDOF 9-DoF fusion
+#define BNO055_PWR_NORMAL       0x00u
+
+// Scale factors
+#define BNO055_Q14_SCALE    (1.0f / 16384.0f)  // quaternion Q14 → float
+#define BNO055_ACCEL_SCALE  (0.01f)             // 0.01 m/s² per LSB
+#define BNO055_GYRO_SCALE   (0.001090830782f)   // (π/180)/16 rad/s per LSB (dps mode)
+#define BNO055_MAG_UT_TO_T  (0.0625e-6f)        // 0.0625 µT per LSB → Tesla
+
+static bool    bno055_present      = false;
+static uint8_t bno055_runtime_addr = BNO055_ADDR_0;
+static float   bno055_yaw_rad      = 0.0f;
+static uint64_t bno055_last_gyro_us = 0u;
+
+static inline float wrap_pi_f(float a) {
+    while (a >  3.14159265358979323846f) a -= 6.28318530717958647692f;
+    while (a < -3.14159265358979323846f) a += 6.28318530717958647692f;
+    return a;
+}
+
+static bool bno055_write_reg(uint8_t reg, uint8_t val) {
+    uint8_t buf[2] = { reg, val };
+    int ret = i2c_write_timeout_us(BNO085_I2C_PORT, bno055_runtime_addr,
+                                   buf, 2u, false, 3000u);
+    return (ret == 2);
+}
+
+static bool bno055_read_regs(uint8_t reg, uint8_t *dst, uint8_t n) {
+    int ret = i2c_write_timeout_us(BNO085_I2C_PORT, bno055_runtime_addr,
+                                   &reg, 1u, true, 3000u);
+    if (ret != 1) return false;
+    ret = i2c_read_timeout_us(BNO085_I2C_PORT, bno055_runtime_addr,
+                              dst, n, false, 5000u);
+    return (ret == (int)n);
+}
+
+// Wait for BNO055 CHIP_ID (0xA0) to become readable within timeout.
+// Returns true once detected, false on timeout.
+static bool bno055_wait_chip_id(uint32_t timeout_ms) {
+    uint64_t deadline = time_us_64() + (uint64_t)timeout_ms * 1000u;
+    while (time_us_64() < deadline) {
+        uint8_t chip_id = 0;
+        if (bno055_read_regs(BNO055_CHIP_ID_REG, &chip_id, 1u)
+            && chip_id == BNO055_CHIP_ID_VAL) {
+            return true;
+        }
+        sleep_ms(10u);
+    }
+    return false;
+}
+
+// Probe and initialise BNO055.  Call only after init_bno085() returns false.
+// Performs I2C bus recovery before probing: the failed BNO085 SHTP transactions
+// can leave SDA held low.  We bit-bang 9 SCL clock pulses (I2C spec §3.1.16)
+// then re-init the peripheral to ensure a clean bus state.
+static bool init_bno055(void) {
+    // --- I2C bus recovery -------------------------------------------
+    // Release I2C peripheral so we can bit-bang the pins.
+    i2c_deinit(BNO085_I2C_PORT);
+
+    gpio_set_function(BNO085_SDA_PIN, GPIO_FUNC_SIO);
+    gpio_set_function(BNO085_SCL_PIN, GPIO_FUNC_SIO);
+    gpio_set_dir(BNO085_SDA_PIN, GPIO_IN);   // SDA — let it float high via pull-up
+    gpio_set_dir(BNO085_SCL_PIN, GPIO_OUT);
+    gpio_pull_up(BNO085_SDA_PIN);
+    gpio_pull_up(BNO085_SCL_PIN);
+
+    // 9 SCL pulses — enough to clock out any partially-transmitted byte
+    for (int i = 0; i < 9; i++) {
+        gpio_put(BNO085_SCL_PIN, 0); sleep_us(5);
+        gpio_put(BNO085_SCL_PIN, 1); sleep_us(5);
+    }
+    // STOP condition: SDA low→high while SCL high
+    gpio_set_dir(BNO085_SDA_PIN, GPIO_OUT);
+    gpio_put(BNO085_SDA_PIN, 0); sleep_us(5);
+    gpio_put(BNO085_SCL_PIN, 1); sleep_us(5);
+    gpio_put(BNO085_SDA_PIN, 1); sleep_us(5);
+
+    // Re-init I2C at BNO055-safe speed (100 kHz).
+    // The BNO055 violates I2C protocol at higher speeds on RP2040/RP2350;
+    // Adafruit's own driver drops to 50 kHz on RP2040 targets.  100 kHz is
+    // reliably documented to work and matches standard-mode I2C.
+    i2c_init(BNO085_I2C_PORT, BNO055_I2C_HZ);
+    gpio_set_function(BNO085_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(BNO085_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(BNO085_SDA_PIN);
+    gpio_pull_up(BNO085_SCL_PIN);
+    sleep_ms(10u);
+    // ----------------------------------------------------------------
+
+    // Full I2C scan — updates ADDR_DBG_I2C0_NDEV / ADDR_DBG_I2C0_DEV*.
+    // Runs after clock speed change so the scan also uses 100 kHz.
+    i2c0_scan_and_record();
+
+    // Init sequence mirrors Adafruit_BNO055::begin() exactly
+    // (Adafruit_BNO055.cpp lines 76–150, as of March 2026).
+    //  • Retry I2C detection up to 850 ms (sensor can take that long after power-on)
+    //  • setMode(CONFIG) BEFORE soft reset
+    //  • delay(30) after reset, then poll for CHIP_ID
+    //  • delay(50) after CHIP_ID reappears
+    //  • PWR_MODE=NORMAL, PAGE_ID=0, SYS_TRIGGER=0x00
+    //  • UNIT_SEL=0x80: m/s², dps, Android pitch orientation (ENU/ROS-friendly)
+    //  • setMode(NDOF): write reg, delay(30), then caller adds delay(20) → 50 ms
+    //  • SYS_STATUS / SYS_ERR read to detect sensor errors before returning true
+    const uint8_t candidates[2] = { BNO055_ADDR_0, BNO055_ADDR_1 };
+    for (int ci = 0; ci < 2; ci++) {
+        bno055_runtime_addr = candidates[ci];
+
+        // Wait up to 850 ms for the chip to appear (Adafruit comment: "can take
+        // 850 ms to boot!").
+        if (!bno055_wait_chip_id(850u)) continue;
+
+        // Switch to CONFIG mode before issuing reset (Adafruit does this first).
+        bno055_write_reg(BNO055_OPR_MODE_REG, BNO055_OPR_CONFIG);
+        sleep_ms(25u);
+
+        // Soft reset: SYS_TRIGGER bit 5 = RST_SYS.
+        bno055_write_reg(BNO055_SYS_TRIGGER_REG, 0x20u);
+        // "Delay increased to 30ms due to power issues" — Adafruit comment.
+        sleep_ms(30u);
+
+        // Poll for CHIP_ID to reappear (up to 650 ms).
+        if (!bno055_wait_chip_id(650u)) continue;
+        sleep_ms(50u);  // extra settle (Adafruit: delay(50) here)
+
+        // Normal power mode.
+        bno055_write_reg(BNO055_PWR_MODE_REG, BNO055_PWR_NORMAL);
+        sleep_ms(10u);
+
+        // Select register page 0.
+        bno055_write_reg(BNO055_PAGE_ID_REG, 0x00u);
+
+        // Clear SYS_TRIGGER (Adafruit writes 0x00 before setMode).
+        bno055_write_reg(BNO055_SYS_TRIGGER_REG, 0x00u);
+        sleep_ms(10u);
+
+        // Explicitly set units: accel=m/s², gyro=dps, Euler=degrees,
+        // temp=Celsius, Android orientation frame (bit7=1 = Android/ENU pitch-up).
+        // Bit 7 = 1: Android mode so pitch goes positive when nose tilts up (ROS-friendly).
+        // All other bits 0: m/s², dps, degrees, Celsius.
+        bno055_write_reg(BNO055_UNIT_SEL_REG, 0x80u);
+        sleep_ms(5u);
+
+        // Use IMU fusion mode (gyro + accel, no magnetometer) for more stable
+        // relative yaw on the robot. Full NDOF heading was too sensitive to
+        // magnetic disturbance from the platform during rotation tests.
+        // Adafruit's setMode() does write + delay(30); caller adds delay(20).
+        bno055_write_reg(BNO055_OPR_MODE_REG, BNO055_OPR_IMUPLUS);
+        sleep_ms(50u);  // 30+20 ms to match Adafruit setMode+post-delay
+
+        // Read SYS_STATUS and SYS_ERR to confirm successful init.
+        // Status 5 = "Fusion algorithm running", 4 = self-test OK.
+        // Any non-zero SYS_ERR means the sensor failed to start.
+        {
+            uint8_t sys_status = 0, sys_err = 0;
+            bno055_read_regs(BNO055_SYS_STATUS_REG, &sys_status, 1u);
+            bno055_read_regs(BNO055_SYS_ERR_REG,    &sys_err,    1u);
+            if (sys_err != 0u) {
+                // Sensor reported an error — skip this address and try the next.
+                continue;
+            }
+        }
+
+        // Initialise calibration status register to 0 (uncalibrated).
+        regs[ADDR_DBG_BNO055_CALIB] = 0x00u;
+        bno055_yaw_rad = 0.0f;
+        bno055_last_gyro_us = 0u;
+        w_f32(ADDR_IMU_ORIENT_W, 1.0f);
+        w_f32(ADDR_IMU_ORIENT_X, 0.0f);
+        w_f32(ADDR_IMU_ORIENT_Y, 0.0f);
+        w_f32(ADDR_IMU_ORIENT_Z, 0.0f);
+
+        bno055_present = true;
+        return true;
+    }
+    return false;
+}
+
+// Read quaternion, linear accel, gyro, and magnetometer from BNO055 and push
+// into the Dynamixel control table.  Called at ~20 Hz from update_sensors().
+static void bno055_update(void) {
+    uint8_t buf[8];
+
+    // Raw accelerometer X Y Z — 0x08–0x0D  (int16, 0.01 m/s² per LSB, gravity-INCLUSIVE)
+    // Use ACC_DATA (not LIA_DATA) to match BNO085's SH2_ACCELEROMETER report and
+    // the ROS sensor_msgs/Imu convention: linear_acceleration must include gravity,
+    // so a stationary sensor flat on the table reads ~+9.8 m/s² on Z.
+    if (bno055_read_regs(BNO055_ACC_DATA_X_LSB, buf, 6u)) {
+        int16_t ax = (int16_t)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8u));
+        int16_t ay = (int16_t)((uint16_t)buf[2] | ((uint16_t)buf[3] << 8u));
+        int16_t az = (int16_t)((uint16_t)buf[4] | ((uint16_t)buf[5] << 8u));
+        w_f32(ADDR_IMU_LIN_ACC_X, ax * BNO055_ACCEL_SCALE);
+        w_f32(ADDR_IMU_LIN_ACC_Y, ay * BNO055_ACCEL_SCALE);
+        w_f32(ADDR_IMU_LIN_ACC_Z, az * BNO055_ACCEL_SCALE);
+    }
+
+    // Gyroscope X Y Z — 0x14–0x19  (int16, (π/180)/16 rad/s per LSB in dps mode)
+    if (bno055_read_regs(BNO055_GYR_DATA_X_LSB, buf, 6u)) {
+        int16_t gx = (int16_t)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8u));
+        int16_t gy = (int16_t)((uint16_t)buf[2] | ((uint16_t)buf[3] << 8u));
+        int16_t gz = (int16_t)((uint16_t)buf[4] | ((uint16_t)buf[5] << 8u));
+        float gx_rad = gx * BNO055_GYRO_SCALE;
+        float gy_rad = gy * BNO055_GYRO_SCALE;
+        float gz_rad = gz * BNO055_GYRO_SCALE;
+        w_f32(ADDR_IMU_ANG_VEL_X, gx_rad);
+        w_f32(ADDR_IMU_ANG_VEL_Y, gy_rad);
+        w_f32(ADDR_IMU_ANG_VEL_Z, gz_rad);
+
+        uint64_t now_us = time_us_64();
+        if (bno055_last_gyro_us != 0u) {
+            float dt = (float)(now_us - bno055_last_gyro_us) / 1e6f;
+            if (dt > 0.0f && dt < 0.25f) {
+                bno055_yaw_rad = wrap_pi_f(bno055_yaw_rad + gz_rad * dt);
+            }
+        }
+        bno055_last_gyro_us = now_us;
+
+        float half_yaw = 0.5f * bno055_yaw_rad;
+        w_f32(ADDR_IMU_ORIENT_W, cosf(half_yaw));
+        w_f32(ADDR_IMU_ORIENT_X, 0.0f);
+        w_f32(ADDR_IMU_ORIENT_Y, 0.0f);
+        w_f32(ADDR_IMU_ORIENT_Z, sinf(half_yaw));
+    }
+
+    // Magnetometer X Y Z — 0x0E–0x13  (int16, 0.0625 µT per LSB → Tesla)
+    if (bno055_read_regs(BNO055_MAG_DATA_X_LSB, buf, 6u)) {
+        int16_t mx = (int16_t)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8u));
+        int16_t my = (int16_t)((uint16_t)buf[2] | ((uint16_t)buf[3] << 8u));
+        int16_t mz = (int16_t)((uint16_t)buf[4] | ((uint16_t)buf[5] << 8u));
+        w_f32(ADDR_IMU_MAG_X, mx * BNO055_MAG_UT_TO_T);
+        w_f32(ADDR_IMU_MAG_Y, my * BNO055_MAG_UT_TO_T);
+        w_f32(ADDR_IMU_MAG_Z, mz * BNO055_MAG_UT_TO_T);
+    }
+
+    // Calibration status — CALIB_STAT (0x35).
+    // bits[7:6]=SYS, [5:4]=GYR, [3:2]=ACC, [1:0]=MAG; 3=fully calibrated.
+    // Exposed at ADDR_DBG_BNO055_CALIB so the host can monitor and warn the
+    // user when magnetometer or system calibration is low.
+    {
+        uint8_t cs = 0;
+        if (bno055_read_regs(BNO055_CALIB_STAT_REG, &cs, 1u)) {
+            regs[ADDR_DBG_BNO055_CALIB] = cs;
+        }
+    }
+}
+
+
+// ============================================================
+// ODOMETRY  (encoder closed-loop, 50 Hz)
 // ============================================================
 
 static int32_t pos_left_ticks  = 0;
 static int32_t pos_right_ticks = 0;
 
+// PID state — incremental/velocity form; pid_output is the running throttle accumulator.
+static float   pid_output[2]     = {0.0f, 0.0f};  // [0]=left, [1]=right
+static float   pid_prev_error[2] = {0.0f, 0.0f};
+static int32_t enc_pid_prev_l    = 0;  // encoder snapshot from last PID cycle
+static int32_t enc_pid_prev_r    = 0;
+
+// Slew-rate limiter state — current ramped setpoints fed into the PID.
+static float   v_left_setpoint   = 0.0f;
+static float   v_right_setpoint  = 0.0f;
+
+// Heading-hold state — encoder-based straight-line correction.
+// Uses accumulated encoder differential (L−R distance) to compute heading
+// error, immune to BNO055 vibration-rectification gyro bias.
+static bool    heading_hold_active = false;
+static float   heading_hold_iterm  = 0.0f;  // integral accumulator
+
+// Encoder differential trim state — accumulated (L−R) distance during straight driving.
+static float   enc_straight_diff   = 0.0f;  // metres
+
 static void update_odometry(float dt) {
     bool torque_on = (regs[ADDR_MOTOR_TORQUE_EN] != 0);
 
+    // ── Commanded velocities ────────────────────────────────────────────────
     float lin_x = 0.0f;
     float ang_z = 0.0f;
     if (torque_on) {
-        // Safety timeout: keep the last commanded velocity as long as the
-        // host is alive (sending any Dynamixel packets — reads, writes,
-        // heartbeat).  If the host disappears for HOST_TIMEOUT_US we
-        // brake.  This lets the teleop keyboard work even though it only
-        // publishes cmd_vel on keypress — the ROS node's 50 ms bulk
-        // READ and 100 ms heartbeat keep last_host_comm_us fresh.
+        // Safety timeout: keep commanded velocity while host is alive.
+        // Teleop keyboard only publishes on keypress; the ROS node's 50 ms
+        // bulk-READ and 100 ms heartbeat keep last_host_comm_us current.
         uint64_t now = time_us_64();
         if (last_cmd_vel_us != 0 && last_host_comm_us != 0
             && (now - last_host_comm_us) < HOST_TIMEOUT_US) {
-            // ROS node writes velocity in 0.01 m/s and 0.01 rad/s integer units.
-            // Divide by 100 to recover SI values.
-            lin_x = (float)r_i32(ADDR_CMD_LINEAR_X)  / 100.0f;  // → m/s
-            ang_z = (float)r_i32(ADDR_CMD_ANGULAR_Z) / 100.0f;   // → rad/s
+            lin_x = (float)r_i32(ADDR_CMD_LINEAR_X) / 100.0f;   // 0.01 m/s units → m/s
+            // Match ROS convention on the physical robot: +angular.z = left / CCW.
+            ang_z = -(float)r_i32(ADDR_CMD_ANGULAR_Z) / 100.0f; // 0.01 rad/s units → rad/s
         }
-        // else: no velocity written yet, or host timed out → lin_x/ang_z stay 0
     }
 
+    // Guard against zero / near-zero dt (shouldn't happen at 50 Hz, but be safe).
+    float safe_dt = (dt > 0.001f) ? dt : 0.020f;
+
+    // ── Heading hold (encoder-based straight-line correction) ─────────────
+    // When driving forward/backward with no commanded rotation, use the
+    // accumulated encoder differential (L−R distance / wheel_separation)
+    // as the heading error and apply a PI controller to keep the robot
+    // driving straight.  This is immune to BNO055 vibration-rectification
+    // gyro bias that corrupts gyro-based heading under motor vibration.
+    //
+    // enc_straight_diff accumulates (left − right) wheel distance while
+    // heading_hold_active is true.  It is updated from encoder readings
+    // later in this function and persists across 50 Hz cycles.
+    // Heading error ≈ enc_straight_diff / wheel_separation (radians).
+    if (regs[ADDR_HEADING_HOLD_EN] != 0u
+        && fabsf(ang_z) < 0.01f && fabsf(lin_x) > 0.005f) {
+        if (!heading_hold_active) {
+            // Start of straight-line segment — reset state
+            enc_straight_diff   = 0.0f;
+            heading_hold_iterm  = 0.0f;   // reset integrator
+            heading_hold_active = true;
+        }
+
+        // Heading error from encoder differential (positive = drifted left/CCW)
+        float heading_err = enc_straight_diff / cfg_wheel_separation;
+        w_f32(ADDR_DBG_HEADING_ERR, heading_err);
+
+        float correction = 0.0f;
+        if (fabsf(heading_err) > HEADING_HOLD_DEADBAND) {
+            float heading_kp = r_f32(ADDR_HEADING_HOLD_KP);
+            float heading_ki = r_f32(ADDR_HEADING_HOLD_KI);
+
+            // P term
+            correction = heading_kp * heading_err;
+
+            // I term — accumulates persistent bias from asymmetric motors
+            heading_hold_iterm += heading_ki * heading_err * safe_dt;
+            // Anti-windup clamp
+            if (heading_hold_iterm >  HEADING_HOLD_I_MAX) heading_hold_iterm =  HEADING_HOLD_I_MAX;
+            if (heading_hold_iterm < -HEADING_HOLD_I_MAX) heading_hold_iterm = -HEADING_HOLD_I_MAX;
+            correction += heading_hold_iterm;
+
+            // Output clamp — limit maximum angular correction
+            if (correction >  HEADING_HOLD_MAX_CORR) correction =  HEADING_HOLD_MAX_CORR;
+            if (correction < -HEADING_HOLD_MAX_CORR) correction = -HEADING_HOLD_MAX_CORR;
+
+            // Positive heading_err means left wheel traveled more → robot
+            // drifted CCW.  Add correction to inject CW angular velocity
+            // (firmware ang_z is negated from ROS: positive → CW physical).
+            ang_z += correction;
+        }
+        w_f32(ADDR_HEADING_HOLD_CORR, correction);
+    } else {
+        heading_hold_active = false;
+        heading_hold_iterm  = 0.0f;   // reset integrator when not straight
+        enc_straight_diff   = 0.0f;   // reset differential on direction change
+        w_f32(ADDR_DBG_HEADING_ERR, 0.0f);
+        w_f32(ADDR_HEADING_HOLD_CORR, 0.0f);
+    }
+
+    // Differential-drive: target wheel speeds in m/s.
     float v_left  = lin_x - ang_z * (cfg_wheel_separation / 2.0f);
     float v_right = lin_x + ang_z * (cfg_wheel_separation / 2.0f);
 
-    // Drive motors — apply per-motor trim before dead-zone/kick logic
-    float thr_l = 0.0f, thr_r = 0.0f;
+    // ── Encoder differential trim ───────────────────────────────────────────
+    // The heading hold already uses enc_straight_diff to compute its
+    // correction via ang_z.  This additional velocity-level trim provides
+    // faster response for small wheel-distance imbalances that the heading
+    // hold PI has not yet integrated out.
+    if (heading_hold_active) {
+        w_f32(ADDR_DBG_ENC_TRIM, 0.0f);
+        w_f32(ADDR_DBG_ENC_DIFF, enc_straight_diff);
+    } else {
+        enc_straight_diff = 0.0f;
+        w_f32(ADDR_DBG_ENC_TRIM, 0.0f);
+        w_f32(ADDR_DBG_ENC_DIFF, 0.0f);
+    }
+
+    // ── Slew-rate limiter ───────────────────────────────────────────────────
+    // Step the per-wheel setpoint toward the target by at most max_step per
+    // cycle.  On torque-off or host timeout the target is 0 and the ramp
+    // drives the setpoint to zero over the same rate, giving a smooth stop.
+    {
+        float ramp = r_f32(ADDR_VEL_RAMP);  // m/s²; 0 = disabled
+        if (ramp > 0.001f) {
+            float max_step = ramp * safe_dt;
+            float dl = v_left  - v_left_setpoint;
+            float dr = v_right - v_right_setpoint;
+            if (dl >  max_step) dl =  max_step;
+            if (dl < -max_step) dl = -max_step;
+            if (dr >  max_step) dr =  max_step;
+            if (dr < -max_step) dr = -max_step;
+            v_left_setpoint  += dl;
+            v_right_setpoint += dr;
+        } else {
+            // Ramping disabled — pass through immediately.
+            v_left_setpoint  = v_left;
+            v_right_setpoint = v_right;
+        }
+    }
+    // Use the ramped setpoints as the PID reference.
+    v_left  = v_left_setpoint;
+    v_right = v_right_setpoint;
+
+    // ── Real encoder delta (atomic snapshot) ───────────────────────────────
+    uint32_t irq_save = save_and_disable_interrupts();
+    int32_t cur_enc_l = enc_count_left;
+    int32_t cur_enc_r = enc_count_right;
+    restore_interrupts(irq_save);
+
+    int32_t delta_enc_l = cur_enc_l - enc_pid_prev_l;
+    int32_t delta_enc_r = cur_enc_r - enc_pid_prev_r;
+    enc_pid_prev_l = cur_enc_l;
+    enc_pid_prev_r = cur_enc_r;
+
+    // Encoder sign is intentionally independent from motor-drive polarity.
+    // On this robot, the H-bridge/motor wiring requires inverted drive polarity
+    // for both motors, but the encoder quadrature itself already follows the
+    // desired forward-positive convention.  Do NOT reuse the motor polarity
+    // flags here, or odometry / measured wheel velocity will be inverted.
+    // The swap flag affects which PWM slice drives which motor, but the encoder
+    // wiring (Grove 3 → left encoder, Grove 4 → right encoder) never changes.
+    float signed_dl = (float)delta_enc_l;
+    float signed_dr = (float)delta_enc_r;
+
+    // Measured wheel velocities (m/s) from encoder.
+    float meas_v_l = signed_dl * ENC_RAD_PER_COUNT * cfg_wheel_radius / safe_dt;
+    float meas_v_r = signed_dr * ENC_RAD_PER_COUNT * cfg_wheel_radius / safe_dt;
+    w_f32(ADDR_DBG_VEL_L, meas_v_l);
+    w_f32(ADDR_DBG_VEL_R, meas_v_r);
+
+    // Accumulate encoder differential during straight-line driving.
+    if (heading_hold_active) {
+        float dl_m = signed_dl * ENC_RAD_PER_COUNT * cfg_wheel_radius;
+        float dr_m = signed_dr * ENC_RAD_PER_COUNT * cfg_wheel_radius;
+        enc_straight_diff += (dl_m - dr_m);
+    }
+
+    // ── Incremental velocity PID (one per wheel) ────────────────────────────
+    // Form:  delta_out = Kp*(err - prev_err) + Ki*err*dt
+    //        output   += delta_out   (bounded; no explicit integral state)
+    // This is equivalent to the TurtleBot3 OpenCR PI controller.
+    // Gains are readable and writable at runtime via ADDR_PID_K* registers.
+    float kp = r_f32(ADDR_PID_KP);
+    float ki = r_f32(ADDR_PID_KI);
+
+    float err_l = v_left  - meas_v_l;
+    float err_r = v_right - meas_v_r;
+
+    if (fabsf(v_left) < 0.001f || !torque_on) {
+        // Target zero (or torque off): reset controller cleanly.
+        pid_output[0]     = 0.0f;
+        pid_prev_error[0] = 0.0f;
+    } else {
+        // Direction-change reset: if commanded direction opposes accumulated output,
+        // reset immediately so the motor reverses without a 5+ second drain.
+        // The kick-start in set_motor() provides the initial burst in the new direction.
+        float cmd_sign_l = (v_left > 0.0f) ? 1.0f : -1.0f;
+        float out_sign_l = (pid_output[0] > 0.001f) ? 1.0f
+                         : (pid_output[0] < -0.001f ? -1.0f : 0.0f);
+        if (out_sign_l != 0.0f && cmd_sign_l != out_sign_l) {
+            pid_output[0] = 0.0f;
+            pid_prev_error[0] = 0.0f;
+        }
+        // Feedforward seed: when output is zero (start-from-rest), initialise at the
+        // open-loop estimate so the motor starts spinning on the first cycle instead
+        // of waiting for the integrator to ramp up from 0.
+        if (fabsf(pid_output[0]) < 0.001f) {
+            pid_output[0] = cmd_sign_l * cfg_motor_min_duty_left;
+        }
+        pid_output[0] += kp * (err_l - pid_prev_error[0]) + ki * err_l * safe_dt;
+        if (pid_output[0] >  PID_OUTPUT_MAX) pid_output[0] =  PID_OUTPUT_MAX;
+        if (pid_output[0] < -PID_OUTPUT_MAX) pid_output[0] = -PID_OUTPUT_MAX;
+    }
+    pid_prev_error[0] = err_l;
+
+    if (fabsf(v_right) < 0.001f || !torque_on) {
+        pid_output[1]     = 0.0f;
+        pid_prev_error[1] = 0.0f;
+    } else {
+        float cmd_sign_r = (v_right > 0.0f) ? 1.0f : -1.0f;
+        float out_sign_r = (pid_output[1] > 0.001f) ? 1.0f
+                         : (pid_output[1] < -0.001f ? -1.0f : 0.0f);
+        if (out_sign_r != 0.0f && cmd_sign_r != out_sign_r) {
+            pid_output[1] = 0.0f;
+            pid_prev_error[1] = 0.0f;
+        }
+        if (fabsf(pid_output[1]) < 0.001f) {
+            pid_output[1] = cmd_sign_r * cfg_motor_min_duty_right;
+        }
+        pid_output[1] += kp * (err_r - pid_prev_error[1]) + ki * err_r * safe_dt;
+        if (pid_output[1] >  PID_OUTPUT_MAX) pid_output[1] =  PID_OUTPUT_MAX;
+        if (pid_output[1] < -PID_OUTPUT_MAX) pid_output[1] = -PID_OUTPUT_MAX;
+    }
+    pid_prev_error[1] = err_r;
+
+    // ── Drive motors ────────────────────────────────────────────────────────
+    // set_motor() still applies dead-zone expansion and kick-start, which give
+    // the initial jolt to overcome static friction on the first cycle.  The PID
+    // then stabilises at the correct steady-state duty.
     if (torque_on) {
-        thr_l = (v_left  / cfg_max_wheel_speed_ms) * cfg_motor_trim_left;
-        thr_r = (v_right / cfg_max_wheel_speed_ms) * cfg_motor_trim_right;
+        float thr_l = pid_output[0];
+        float thr_r = pid_output[1];
         if (cfg_swap_left_right_motors) {
             set_motor(pwm_slice_m1, cfg_right_motor_reversed != 0u, thr_r, 1);
             set_motor(pwm_slice_m2, cfg_left_motor_reversed  != 0u, thr_l, 0);
@@ -1878,55 +2541,27 @@ static void update_odometry(float dt) {
             set_motor(pwm_slice_m1, cfg_left_motor_reversed  != 0u, thr_l, 0);
             set_motor(pwm_slice_m2, cfg_right_motor_reversed != 0u, thr_r, 1);
         }
-        // LED feedback: on while motors are actively driven
         gpio_put(PIN_LED, (fabsf(thr_l) > 0.001f || fabsf(thr_r) > 0.001f));
     } else {
         brake_all();
         gpio_put(PIN_LED, false);
     }
 
-    // Compute the effective velocity that matches what set_motor() actually applies.
-    // set_motor() expands [0.001, 1.0] → [MOTOR_MIN_DUTY, 1.0] (dead-zone compensation).
-    // Using the raw commanded v_left/v_right for tick accumulation would make odom
-    // under-report actual motion, causing move_distance to stop too early (e.g. 5 cm
-    // instead of 10 cm).  Apply the same expansion here so ticks reflect real motion.
-    //
-    // We use the UNTRIMMED throttle (v / MAX_WHEEL_SPEED_MS, no MOTOR_TRIM factor)
-    // so that straight-line distance odom is unaffected by trim asymmetry corrections —
-    // trim accounts for motor hardware differences, not for the commanded trajectory.
-    float eff_v_left  = 0.0f;
-    float eff_v_right = 0.0f;
-    if (torque_on) {
-        float raw_l = fabsf(v_left  / cfg_max_wheel_speed_ms);
-        float raw_r = fabsf(v_right / cfg_max_wheel_speed_ms);
-        if (raw_l > 0.001f) {
-            float eff_l = (cfg_motor_min_duty_left > 0.0f)
-                          ? cfg_motor_min_duty_left + raw_l * (1.0f - cfg_motor_min_duty_left)
-                          : raw_l;
-            eff_v_left  = (v_left  >= 0.0f ? 1.0f : -1.0f) * eff_l * cfg_max_wheel_speed_ms;
-        }
-        if (raw_r > 0.001f) {
-            float eff_r = (cfg_motor_min_duty_right > 0.0f)
-                          ? cfg_motor_min_duty_right + raw_r * (1.0f - cfg_motor_min_duty_right)
-                          : raw_r;
-            eff_v_right = (v_right >= 0.0f ? 1.0f : -1.0f) * eff_r * cfg_max_wheel_speed_ms;
-        }
-    }
-
-    // Wheel velocities (Dynamixel RPM units) — report effective velocity
+    // ── Wheel velocities (Dynamixel RPM units) — from real encoder ──────────
     float vel_scale = rpm_per_ms();
-    w_i32(ADDR_PRESENT_VEL_L, (int32_t)(eff_v_left  * vel_scale));
-    w_i32(ADDR_PRESENT_VEL_R, (int32_t)(eff_v_right * vel_scale));
+    w_i32(ADDR_PRESENT_VEL_L, (int32_t)(meas_v_l * vel_scale));
+    w_i32(ADDR_PRESENT_VEL_R, (int32_t)(meas_v_r * vel_scale));
 
-    // Wheel positions (accumulating ticks) — use effective velocity
-    float d_rad_l = (eff_v_left  * dt) / cfg_wheel_radius;
-    float d_rad_r = (eff_v_right * dt) / cfg_wheel_radius;
+    // ── Wheel positions (Dynamixel ticks) — from real encoder delta ─────────
+    // delta_dxl = signed_dl_counts × ENC_RAD_PER_COUNT × TICKS_PER_RAD
+    // ≈ signed_dl_counts × 1.067  (3840 raw counts ≈ 4096 Dxl ticks per rev)
+    float d_rad_l = signed_dl * ENC_RAD_PER_COUNT;
+    float d_rad_r = signed_dr * ENC_RAD_PER_COUNT;
 
     int64_t new_l = (int64_t)pos_left_ticks  + (int64_t)(d_rad_l * TICKS_PER_RAD);
     int64_t new_r = (int64_t)pos_right_ticks + (int64_t)(d_rad_r * TICKS_PER_RAD);
 
-    // Wrap position counters on int32 overflow (wheel has turned many revolutions).
-    // The ROS node treats these as signed 32-bit accumulators, so we wrap rather than clamp.
+    // Wrap on int32 overflow — ROS node treats these as signed 32-bit accumulators.
     if (new_l >  2147483647LL) new_l -= 4294967296LL;
     if (new_l < -2147483648LL) new_l += 4294967296LL;
     if (new_r >  2147483647LL) new_r -= 4294967296LL;
@@ -1991,9 +2626,12 @@ static void update_sensors(uint64_t now_us) {
     }
 
     // IMU re-calibration trigger:
-    //   Write 1 → recalibrate: enable ME cal, wait 5 s for convergence, save DCD.
+    //   Write 1 → recalibrate:
+    //             - BNO085: enable ME cal, wait 5 s for convergence, save DCD.
+    //             - BNO055: soft re-init sensor fusion (clears runtime calibration).
     //   Write 2 → clear DCD:   disable all ME cal, save (zeroing the flash DCD),
-    //             then re-enable ME cal so the sensor reverts to factory offsets.
+    //             then re-enable ME cal so the BNO085 reverts to factory offsets.
+    //             On BNO055, this performs the same soft re-init as value 1.
     if (regs[ADDR_IMU_RECAL] == 2) {
         if (bno085_present) {
             // Disable all ME calibration channels and immediately save the empty
@@ -2011,6 +2649,9 @@ static void update_sensors(uint64_t now_us) {
             // Re-enable ME calibration for normal operation going forward
             bno085_enable_me_calibration();
             sleep_ms(20u);
+        } else if (bno055_present) {
+            // BNO055 has no SH-2 DCD mechanism; re-initialise fusion state.
+            bno055_present = init_bno055();
         }
         regs[ADDR_IMU_RECAL] = 0;
     } else if (regs[ADDR_IMU_RECAL] == 1) {
@@ -2025,6 +2666,9 @@ static void update_sensors(uint64_t now_us) {
             bno085_wait_for_calibration(5000u);
             bno085_save_dcd();
             sleep_ms(20u);
+        } else if (bno055_present) {
+            // Re-init BNO055 to restart fusion/calibration after sensor changes.
+            bno055_present = init_bno055();
         } else {
             // No hardware IMU — reset to static identity values
             w_f32(ADDR_IMU_ORIENT_W,  1.0f);
@@ -2042,13 +2686,51 @@ static void update_sensors(uint64_t now_us) {
     }
 
     // If a real IMU is connected, overwrite the simulated IMU registers with
-    // live sensor data.  BNO085 (Grove 1, I2C0) is used when present.
+    // live sensor data.  Dispatch controlled by IMU_TYPE compile flag.
+#if IMU_TYPE == 1
+    if (bno085_present) { bno085_update(); }
+#elif IMU_TYPE == 2
+    if (bno055_present) { bno055_update(); }
+#elif IMU_TYPE == 3
+    /* SIMULATED: no hardware update needed */
+#else  /* AUTO */
     if (bno085_present) {
         bno085_update();
+    } else if (bno055_present) {
+        bno055_update();
     }
+#endif
 
-    // Ultrasonic sensors — only runs when ADDR_USS_ENABLE ≠ 0.
-    update_ultrasonic();
+    // Encoder reset — host writes non-zero to ADDR_ENC_RESET to zero counters.
+    if (regs[ADDR_ENC_RESET]) {
+        regs[ADDR_ENC_RESET] = 0u;
+        uint32_t saved = save_and_disable_interrupts();
+        enc_count_left  = 0;
+        enc_count_right = 0;
+        enc_irq_dbg     = 0;
+        enc_last_us[0] = enc_last_us[1] = enc_last_us[2] = enc_last_us[3] = 0;
+        enc_prev_state_left = (uint8_t)((gpio_get(PIN_ENC_L_A) ? 0x01u : 0u) |
+                                        (gpio_get(PIN_ENC_L_B) ? 0x02u : 0u));
+        enc_prev_state_right = (uint8_t)((gpio_get(PIN_ENC_R_A) ? 0x01u : 0u) |
+                                         (gpio_get(PIN_ENC_R_B) ? 0x02u : 0u));
+        restore_interrupts(saved);
+    }
+    // Snapshot encoder counts + debug counter atomically and push to register table.
+    uint32_t saved = save_and_disable_interrupts();
+    int32_t snap_l = enc_count_left;
+    int32_t snap_r = enc_count_right;
+    uint32_t snap_dbg = enc_irq_dbg;
+    restore_interrupts(saved);
+    w_i32(ADDR_ENC_L_COUNT, snap_l);
+    w_i32(ADDR_ENC_R_COUNT, snap_r);
+    w_i32(ADDR_ENC_IRQ_DBG, (int32_t)snap_dbg);
+    // Raw GPIO pin snapshot (bit 0=LA, 1=LB, 2=RA, 3=RB)
+    regs[ADDR_ENC_GPIO_RAW] = (uint8_t)(
+        (gpio_get(PIN_ENC_L_A) ? 0x01u : 0u) |
+        (gpio_get(PIN_ENC_L_B) ? 0x02u : 0u) |
+        (gpio_get(PIN_ENC_R_A) ? 0x04u : 0u) |
+        (gpio_get(PIN_ENC_R_B) ? 0x08u : 0u));
+
 }
 
 // ============================================================
@@ -2099,7 +2781,6 @@ int main(void) {
     init_ups_gpio();
     init_buzzer();
     init_adc();
-    init_ultrasonic();
 
     // Onboard LED for motor-activity feedback
     gpio_init(PIN_LED);
@@ -2115,27 +2796,55 @@ int main(void) {
     board_init();
     tud_init(0);
 
+    // Init encoders AFTER board_init/tud_init so our GPIO IRQ callback is
+    // registered last and cannot be overwritten by TinyUSB BSP init.
+    init_encoders();
+
     // Play the startup melody (same ascending arpeggio as real TurtleBot3 OpenCR)
     // before the IMU probe so the ~500 ms calibration wait runs after the melody.
     play_melody_blocking(MEL_ON);
 
-    // Probe IMU — BNO085 on Grove 1 (GP0/GP1, I2C0).
-    // init_bno085() sets GP0/GP1 to GPIO_FUNC_I2C here; board_init() above
-    // had set them to UART0 — this override is intentional and permanent.
-    // Falls back to static simulated IMU if BNO085 is not detected.
+    // Probe IMU — BNO085/BNO055 on Grove 2 (GP2/GP3, I2C1).
+    // IMU bring-up — behaviour controlled by the IMU_TYPE compile flag.
+#if IMU_TYPE == 3
+    // SIMULATED: skip all hardware; leave IMU source = 0.
+    regs[ADDR_DBG_IMU_SOURCE] = 0u;
+#elif IMU_TYPE == 2
+    // BNO055 only: skip the long BNO085 SHTP probe entirely.
+    bno055_present = init_bno055();
+    regs[ADDR_DBG_IMU_SOURCE] = bno055_present ? 2u : 0u;
+#elif IMU_TYPE == 1
+    // BNO085 only: probe BNO085; skip BNO055 init.
     bno085_present = init_bno085();
-    // Record which IMU source is active for the debug register.
-    if (bno085_present) regs[ADDR_DBG_IMU_SOURCE] = 1u;
-    else                regs[ADDR_DBG_IMU_SOURCE] = 0u;
+    regs[ADDR_DBG_IMU_SOURCE] = bno085_present ? 1u : 0u;
+#else
+    // AUTO (0): try BNO085 first, fall back to BNO055, then simulated.
+    // init_bno085() sets GP0/GP1 to GPIO_FUNC_I2C; board_init() above
+    // had set them to UART0 — this override is intentional and permanent.
+    bno085_present = init_bno085();
+    if (!bno085_present) {
+        // BNO085 not found — try BNO055 as a drop-in fallback.
+        bno055_present = init_bno055();
+    }
+    if      (bno085_present) regs[ADDR_DBG_IMU_SOURCE] = 1u;  // BNO085
+    else if (bno055_present) regs[ADDR_DBG_IMU_SOURCE] = 2u;  // BNO055
+    else                     regs[ADDR_DBG_IMU_SOURCE] = 0u;  // simulated
+#endif
 
     uint64_t last_odom_us   = time_us_64();
     uint64_t last_sensor_us = time_us_64();
+    uint64_t last_loop_us   = time_us_64();
 
     while (true) {
         // Drive the USB stack
         tud_task();
 
         uint64_t now = time_us_64();
+        uint32_t loop_gap_us = (uint32_t)(now - last_loop_us);
+        last_loop_us = now;
+        if ((uint32_t)r_i32(ADDR_DIAG_LOOP_MAX_US) < loop_gap_us) {
+            w_i32(ADDR_DIAG_LOOP_MAX_US, (int32_t)loop_gap_us);
+        }
 
         // Advance the melody sequencer every loop iteration for tight timing
         update_melody(now);
@@ -2144,13 +2853,23 @@ int main(void) {
         if (now - last_odom_us >= ODOM_INTERVAL_US) {
             float dt = (float)(now - last_odom_us) / 1e6f;
             last_odom_us = now;
+            uint64_t odom_start_us = time_us_64();
             update_odometry(dt);
+            uint32_t odom_dur_us = (uint32_t)(time_us_64() - odom_start_us);
+            if ((uint32_t)r_i32(ADDR_DIAG_ODOM_MAX_US) < odom_dur_us) {
+                w_i32(ADDR_DIAG_ODOM_MAX_US, (int32_t)odom_dur_us);
+            }
         }
 
         // Sensor update at 20 Hz
         if (now - last_sensor_us >= SENSOR_INTERVAL_US) {
             last_sensor_us = now;
+            uint64_t sensor_start_us = time_us_64();
             update_sensors(now);
+            uint32_t sensor_dur_us = (uint32_t)(time_us_64() - sensor_start_us);
+            if ((uint32_t)r_i32(ADDR_DIAG_SENSOR_MAX_US) < sensor_dur_us) {
+                w_i32(ADDR_DIAG_SENSOR_MAX_US, (int32_t)sensor_dur_us);
+            }
         }
 
         // Process any incoming Dynamixel bytes from the host
