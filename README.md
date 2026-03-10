@@ -115,6 +115,71 @@ legacy sonar register `38` (`float`, meters).
 
 ---
 
+## Raspberry Pi Ultrasonic Sensors (GPIO-direct)
+
+Two **Grove Ultrasonic Ranger V2.0** modules can be connected directly to the
+Raspberry Pi's GPIO header for low-latency obstacle detection, independent of
+the Pico firmware.
+
+### Wiring
+
+```
+Grove Ultrasonic Ranger V2.0         Raspberry Pi GPIO Header
+┌───────────────────────┐            ┌──────────────────────────┐
+│  LEFT sensor          │            │                          │
+│  VCC (red)    ────────┼──────────► │  Pin 1  (3.3V)          │
+│  GND (black)  ────────┼──────────► │  Pin 6  (GND)           │
+│  SIG (yellow) ────────┼──────────► │  Pin 16 (BCM GPIO 23)   │
+│  NC  (white)          │            │                          │
+└───────────────────────┘            │                          │
+                                     │                          │
+┌───────────────────────┐            │                          │
+│  RIGHT sensor         │            │                          │
+│  VCC (red)    ────────┼──────────► │  Pin 17 (3.3V)          │
+│  GND (black)  ────────┼──────────► │  Pin 14 (GND)           │
+│  SIG (yellow) ────────┼──────────► │  Pin 18 (BCM GPIO 24)   │
+│  NC  (white)          │            │                          │
+└───────────────────────┘            └──────────────────────────┘
+```
+
+| Sensor | SIG wire | Pi header pin | BCM GPIO | CLI override |
+|--------|----------|---------------|----------|-------------|
+| Left   | Yellow   | Pin 16        | **23**   | `--left-gpio 23` |
+| Right  | Yellow   | Pin 18        | **24**   | `--right-gpio 24` |
+| VCC    | Red      | Pin 1 or 17   | 3.3V     | — |
+| GND    | Black    | Pin 6 or 14   | GND      | — |
+
+> **No level shifter needed.**  The Grove Ultrasonic Ranger V2.0 operates at
+> 3.3V–5V and uses a single-wire protocol compatible with the Pi's 3.3V GPIO.
+> The white (NC) wire on each Grove cable is unused.
+
+### Testing (no ROS 2)
+
+```bash
+# Single sensor on GPIO 23
+python3 pi_ultrasonic_singlewire.py --gpio 23
+
+# Both sensors
+python3 pi_ultrasonic_dual.py
+```
+
+### ROS 2 publisher
+
+```bash
+# Publishes /ultrasonic/left and /ultrasonic/right (sensor_msgs/Range, 8 Hz)
+python3 pi_ultrasonic_dual_ros2.py
+
+# Monitor in another terminal
+python3 pi_ultrasonic_realtime_ros2.py
+```
+
+| Topic | Message type | Frame ID |
+|-------|-------------|----------|
+| `/ultrasonic/left`  | `sensor_msgs/Range` | `ultrasonic_left_link` |
+| `/ultrasonic/right` | `sensor_msgs/Range` | `ultrasonic_right_link` |
+
+---
+
 ## ROS 2 configuration
 
 ### burger.yaml (in src/turtlebot3/turtlebot3_bringup/param/)
@@ -141,6 +206,143 @@ Expected startup sequence:
 2. It writes `1` to `imu_re_calibration` (address 59) and waits **5 seconds**
    — the firmware resets the simulated IMU registers and clears the flag.
 3. Node starts publishing `/joint_states`, `/imu`, `/battery_state`, etc.
+
+---
+
+## Service Management (systemd)
+
+The robot runs two systemd services that can be started automatically on boot
+or controlled manually at any time.
+
+| Service | Purpose |
+|---------|---------|
+| `turtlebot3-bringup.service` | `turtlebot3_node` + YDLidar |
+| `turtlebot3-camera.service` | Pi Camera Module 3 streamer |
+
+### One-time setup (install & enable autostart)
+
+Run this **once** as root to install the service units and enable them:
+
+```bash
+sudo bash ~/setup-autostart.sh
+```
+
+This creates the service files under `/etc/systemd/system/`, enables them, and
+starts them immediately.  On every subsequent boot they will start automatically.
+
+---
+
+### Starting and stopping (helper scripts)
+
+Two convenience scripts are provided in the home directory:
+
+```bash
+# Start (or restart) both services
+~/start_services.sh
+
+# Stop both services
+~/stop_services.sh
+```
+
+> The scripts call `systemctl` internally; you may need `sudo` depending on
+> your polkit / sudoers configuration.
+
+---
+
+### Direct systemctl control
+
+```bash
+# Start
+sudo systemctl start turtlebot3-bringup.service
+sudo systemctl start turtlebot3-camera.service
+
+# Stop
+sudo systemctl stop turtlebot3-bringup.service
+sudo systemctl stop turtlebot3-camera.service
+
+# Restart
+sudo systemctl restart turtlebot3-bringup.service
+sudo systemctl restart turtlebot3-camera.service
+
+# Check status
+sudo systemctl status turtlebot3-bringup.service
+sudo systemctl status turtlebot3-camera.service
+```
+
+---
+
+### Viewing logs
+
+```bash
+# Live log — bringup (robot node + lidar)
+journalctl -fu turtlebot3-bringup
+
+# Live log — camera
+journalctl -fu turtlebot3-camera
+
+# Last 50 lines from both services
+journalctl -n 50 -u turtlebot3-bringup -u turtlebot3-camera
+```
+
+---
+
+### Enabling / disabling autostart
+
+```bash
+# Prevent services from starting on boot (does not stop them now)
+sudo systemctl disable turtlebot3-bringup.service
+sudo systemctl disable turtlebot3-camera.service
+
+# Re-enable autostart
+sudo systemctl enable turtlebot3-bringup.service
+sudo systemctl enable turtlebot3-camera.service
+```
+
+---
+
+### Ultrasonic sensors (`pi-ultrasonic-dual.service`)
+
+The GPIO-direct dual ultrasonic publisher runs as a separate systemd service.
+
+#### One-time install
+
+```bash
+# Install and enable the service (runs immediately and on every boot)
+bash ~/turtlebot3_robopico/install-pi-ultrasonic-service.sh
+```
+
+This copies `systemd/pi-ultrasonic-dual.service` to `/etc/systemd/system/` and
+enables it.  The service publishes on `ROS_DOMAIN_ID=42` using GPIO 23 (left)
+and GPIO 24 (right) at 8 Hz.
+
+#### Manual start / stop
+
+```bash
+sudo systemctl start   pi-ultrasonic-dual.service
+sudo systemctl stop    pi-ultrasonic-dual.service
+sudo systemctl restart pi-ultrasonic-dual.service
+sudo systemctl status  pi-ultrasonic-dual.service
+```
+
+#### Logs
+
+```bash
+journalctl -fu pi-ultrasonic-dual.service
+```
+
+#### Run without systemd (standalone)
+
+```bash
+# No ROS 2 — prints distances to stdout
+python3 ~/turtlebot3_robopico/pi_ultrasonic_dual.py
+
+# ROS 2 publisher (publishes /ultrasonic/left and /ultrasonic/right)
+python3 ~/turtlebot3_robopico/pi_ultrasonic_dual_ros2.py \
+  --left-gpio 23 --right-gpio 24 --rate 8.0
+
+# Monitor live readings (requires the publisher above to be running)
+python3 ~/turtlebot3_robopico/pi_ultrasonic_realtime_ros2.py
+```
 
 ---
 

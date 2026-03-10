@@ -19,7 +19,7 @@ Workflow
       - Repeat up to ALIGN_MAX_ITER times.
     Align — Stage 2 (ultrasonic, fine):
       - Sample both L/R sensors repeatedly.
-      - If d_left ≠ d_right the robot is angled; rotate by asin(Δ/sep) to equalise.
+      - If d_left ≠ d_right the robot is angled; rotate by -asin(Δ/sep) to equalise.
       - Repeat until |d_left − d_right| < USS_FINE_TOL_M (1 cm) or max iters.
 3.  Space check:
       - Read current ultrasonic distance (both sensors averaged) = uss_start.
@@ -571,7 +571,9 @@ def align_fine_uss(node: LinearCalibNode,
     Fine-tune wall perpendicularity using the left/right ultrasonic differential.
 
     When d_left == d_right the robot is square to the wall.
-    If d_left > d_right the robot is yawed clockwise → rotate left (positive ang_z).
+    Both sensors face forward toward the wall, so:
+      d_left > d_right  → left beam is more oblique → robot yawed CCW → rotate CW  (negative ang_z)
+      d_left < d_right  → right beam is more oblique → robot yawed CW  → rotate CCW (positive ang_z)
     Skipped if both sensors are not active.
     """
     if "left" not in active_sides or "right" not in active_sides \
@@ -591,7 +593,7 @@ def align_fine_uss(node: LinearCalibNode,
             print(f"  {YLW}USS reading unavailable — aborting fine-align.{NC}")
             return False
 
-        delta = d_left - d_right   # +ve → left farther → robot yawed CW → rotate CCW
+        delta = d_left - d_right   # +ve → left farther → robot yawed CCW → rotate CW (negative ang_z)
         print(f"  Iter {iteration+1}/{max_iter}:  "
               f"L={d_left*100:.1f} cm  R={d_right*100:.1f} cm  "
               f"Δ={delta*100:+.1f} cm")
@@ -601,11 +603,12 @@ def align_fine_uss(node: LinearCalibNode,
                   f"(Δ={delta*1000:+.0f} mm < {tol_m*1000:.0f} mm){NC}")
             return True
 
-        # Geometric correction: θ = asin(Δ / sep), clamped to avoid domain error
+        # Geometric correction: θ = asin(Δ / sep), clamped to avoid domain error.
+        # Negate: positive delta → CW correction (negative angular velocity).
         clamped    = max(-sensor_sep * 0.98, min(sensor_sep * 0.98, delta))
         rotate_rad = math.asin(clamped / sensor_sep)
         rotate_time = abs(rotate_rad) / speed
-        node.drive_for(0.0, math.copysign(speed, rotate_rad), rotate_time)
+        node.drive_for(0.0, -math.copysign(speed, rotate_rad), rotate_time)
         node.stop(0.30)
 
     # Final check after exhausting iterations

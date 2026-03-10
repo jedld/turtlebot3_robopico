@@ -22,11 +22,17 @@ target_include_directories(turtlebot3_pico_fw PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}   # finds tusb_config.h
 )
 
+# Generate the PIO header from the quadrature encoder PIO program.
+pico_generate_pio_header(turtlebot3_pico_fw
+    ${CMAKE_CURRENT_LIST_DIR}/quadrature_encoder.pio
+)
+
 target_link_libraries(turtlebot3_pico_fw
     pico_stdlib
     hardware_pwm
     hardware_adc
     hardware_i2c
+    hardware_pio
     hardware_watchdog
     tinyusb_device
     tinyusb_board

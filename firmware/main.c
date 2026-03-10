@@ -49,9 +49,11 @@
 #include "hardware/sync.h"
 #include "hardware/watchdog.h"
 #include "hardware/irq.h"
+#include "hardware/pio.h"
 #include "pico/bootrom.h"
 #include "bsp/board.h"
 #include "tusb.h"
+#include "quadrature_encoder.pio.h"
 
 // ============================================================
 // CONFIGURATION
@@ -115,14 +117,14 @@
 //   turtlebot3_bringup/param/humble/burger.yaml
 // ============================================================
 
-#define WHEEL_RADIUS_DEFAULT        0.033000f  // metres — Cytron 65 mm wheel physical radius
+#define WHEEL_RADIUS_DEFAULT        0.031826f  // calibrated 2026-03-09
 // ANGULAR CALIBRATION: do NOT use a scale factor (it breaks odometry).
 // Tune WHEEL_SEPARATION to match effective turning base; run auto_calibrate_imu_turn.py.
 #define WHEEL_SEPARATION_DEFAULT    0.121642f  // metres — effective turning base; calibrated by auto_calibrate_imu_turn.py
 #define MAX_WHEEL_SPEED_MS_DEFAULT  0.550000f  // m/s — FIT0450 @6V no-load ≈160RPM×π×0.065
-#define LEFT_MOTOR_REVERSED_DEFAULT  0       // CHAN_A = physical forward for left motor
-#define RIGHT_MOTOR_REVERSED_DEFAULT 1       // CHAN_B = physical forward for right motor
-#define SWAP_LEFT_RIGHT_MOTORS_DEFAULT 0      // motors physically swapped: left→M1, right→M2
+#define LEFT_MOTOR_REVERSED_DEFAULT  1       // CHAN_B = physical forward for left motor (M2)
+#define RIGHT_MOTOR_REVERSED_DEFAULT 0       // CHAN_A = physical forward for right motor (M1)
+#define SWAP_LEFT_RIGHT_MOTORS_DEFAULT 1      // motors physically swapped: M1→right, M2→left
 
 // Minimum duty cycle (dead-zone compensation).
 // DFRobot FIT0450 TT Motor with Encoder (6V 160RPM 120:1) — higher gear
@@ -177,14 +179,25 @@
 // (L−R distance / wheel_separation) keeps the robot driving straight.
 // Uses encoder feedback instead of gyro to avoid BNO055 vibration-rectification bias.
 // Units: rad/s angular velocity correction per radian heading error.
-#define HEADING_HOLD_KP_DEFAULT   4.0f
-#define HEADING_HOLD_KI_DEFAULT   1.0f   // integral gain ─ eliminates steady-state drift
+#define HEADING_HOLD_KP_DEFAULT   4.0f   // P gain — fast correction: 7.6mm enc_diff saturates at MAX_CORR
+#define HEADING_HOLD_KI_DEFAULT   0.5f   // I gain — eliminates persistent motor asymmetry bias in ~2 s
 // Ignore heading errors below this threshold to avoid micro-oscillations.
 #define HEADING_HOLD_DEADBAND     0.003f  // rad ≈ 0.17°
-// Maximum angular correction the heading-hold can inject (rad/s).
-#define HEADING_HOLD_MAX_CORR     1.0f
+// Maximum angular correction (rad/s) injected into ang_z.
+//
+// FORWARD (lin_x > 0): capped at 0.25 rad/s so the slower wheel can't go below
+// the motor dead-zone.  At wheel_sep=0.121 m: ±15 mm/s per wheel.
+// Safe limit: v_wheel_min = 0.1 − 0.25×0.0608 = 84.8 mm/s > dead-zone (82.5 mm/s).
+//
+// REVERSE (lin_x < 0): capped at 0.55 rad/s.  In reverse the correction SLOWS
+// the STRONGER motor rather than speeding up the weaker one — so a large cap is
+// needed to bring the faster wheel down to the slower wheel's physical limit.
+// At 0.55 rad/s: the strong wheel is slowed by 33 mm/s (100→67 mm/s), which is
+// enough to match a weak motor that tops out at ~70 mm/s backward.
+#define HEADING_HOLD_MAX_CORR     0.25f  // forward limit
+#define HEADING_HOLD_MAX_CORR_REV 0.55f  // reverse limit — larger to overcome asymmetry
 // Anti-windup clamp for the integral accumulator (rad·s).
-#define HEADING_HOLD_I_MAX        0.5f
+#define HEADING_HOLD_I_MAX        0.30f
 
 // Encoder differential trim — equalises left/right wheel distance during
 // straight-line driving.  Complements the gyro heading hold with direct
@@ -385,7 +398,7 @@ static bool load_calibration_from_flash(void) {
 // CONTROL TABLE  (register map — must be large enough for all defined ADDR_* + their width)
 // ============================================================
 
-#define REG_SIZE 276u
+#define REG_SIZE 312u
 static uint8_t regs[REG_SIZE];
 
 // --- typed register accessors --------------------------------
@@ -521,16 +534,18 @@ static inline void w_f32(uint addr, float v) {
 // Heading-hold (gyro-based straight-line correction)
 // When cmd_vel has lin_x ≠ 0 and ang_z ≈ 0, the firmware locks the current
 // gyro yaw and applies a proportional correction to keep the robot straight.
-#define ADDR_HEADING_HOLD_KP  240u  // float (read/write) — P gain for heading hold
-#define ADDR_DBG_HEADING_ERR  244u  // float (read-only)  — current heading error (rad)
-#define ADDR_HEADING_HOLD_EN  248u  // uint8 (read/write) — 1=enabled (default), 0=disabled
-#define ADDR_HEADING_HOLD_KI  252u  // float (read/write) — I gain for heading hold
-#define ADDR_HEADING_HOLD_CORR 256u // float (read-only)  — current ang_z correction (rad/s)
+// NOTE: 240–255 are used by ADDR_DIAG_PKT_COUNT/CRC_FAIL/VEL_WRITES/READ_COUNT.
+// Heading-hold registers start at 280 to avoid aliasing those diagnostic counters.
+#define ADDR_HEADING_HOLD_KP  280u  // float (read/write) — P gain for heading hold
+#define ADDR_DBG_HEADING_ERR  284u  // float (read-only)  — current heading error (rad)
+#define ADDR_HEADING_HOLD_EN  288u  // uint8 (read/write) — 1=enabled (default), 0=disabled
+#define ADDR_HEADING_HOLD_KI  292u  // float (read/write) — I gain for heading hold
+#define ADDR_HEADING_HOLD_CORR 296u // float (read-only)  — current ang_z correction (rad/s)
 
 // Encoder differential trim (straight-line wheel equalisation)
-#define ADDR_ENC_TRIM_KP   260u  // float (read/write) — gain for encoder trim
-#define ADDR_DBG_ENC_TRIM  264u  // float (read-only)  — current per-wheel trim (m/s)
-#define ADDR_DBG_ENC_DIFF  268u  // float (read-only)  — accumulated L−R distance diff (m)
+#define ADDR_ENC_TRIM_KP   300u  // float (read/write) — gain for encoder trim
+#define ADDR_DBG_ENC_TRIM  304u  // float (read-only)  — current per-wheel trim (m/s)
+#define ADDR_DBG_ENC_DIFF  308u  // float (read-only)  — accumulated L−R distance diff (m)
 
 // Runtime diagnostics (read-only, addr 224–239)
 #define ADDR_DIAG_USB_TX_STALLS 224u  // uint32 — status packets dropped because USB TX stopped draining
@@ -571,12 +586,12 @@ static void init_registers(void) {
     w_i32(ADDR_DIAG_ODOM_MAX_US, 0);
     w_i32(ADDR_DIAG_LOOP_MAX_US, 0);
 
-    // Heading hold — TEMPORARILY DISABLED for PID debugging
+    // Heading hold — enabled by default; corrects straight-line drift in both forward and reverse.
     w_f32(ADDR_HEADING_HOLD_KP, HEADING_HOLD_KP_DEFAULT);
     w_f32(ADDR_HEADING_HOLD_KI, HEADING_HOLD_KI_DEFAULT);
     w_f32(ADDR_DBG_HEADING_ERR, 0.0f);
     w_f32(ADDR_HEADING_HOLD_CORR, 0.0f);
-    regs[ADDR_HEADING_HOLD_EN] = 0u;  // disabled for now
+    regs[ADDR_HEADING_HOLD_EN] = 1u;  // enabled
 
     // Encoder differential trim — enabled by default (Kp > 0)
     w_f32(ADDR_ENC_TRIM_KP, ENC_TRIM_KP_DEFAULT);
@@ -1431,102 +1446,74 @@ static float read_vsys(void) {
 static bool  vbatt_low_alerted = false;  // latch so warning plays only once
 
 // ============================================================
-// QUADRATURE ENCODER — DFRobot FIT0450 (Grove 3 = left, Grove 4 = right)
+// QUADRATURE ENCODER — PIO-based X4 decoder (DFRobot FIT0450)
 // ============================================================
 //
-// X4 decoding: interrupt on every edge of both A and B channels.
-// At each edge: sample the other channel to determine direction.
+// Uses RP2350 PIO state machines instead of GPIO edge interrupts.
+// One state machine per encoder, both sharing a single PIO program.
 //
-//   A rising  + B=0 → forward (+1)    A rising  + B=1 → reverse (−1)
-//   A falling + B=1 → forward (+1)    A falling + B=0 → reverse (−1)
-//   B rising  + A=1 → forward (+1)    B rising  + A=0 → reverse (−1)
-//   B falling + A=0 → forward (+1)    B falling + A=1 → reverse (−1)
+// Advantages over the previous GPIO IRQ approach:
+//   • No software debounce needed — PIO's synchronous sampling inherently
+//     rejects sub-sample-period glitches (including TXS0108E ringing).
+//   • Confirmed-change logic: two consecutive samples must agree before a
+//     transition is accepted, adding ~0.8 µs glitch rejection window.
+//   • FIFO buffered: 8-deep RX FIFO (TX joined into RX) means the CPU ISR
+//     can tolerate much more latency without losing edges.
+//   • Zero missed edges: no debounce timer race with real encoder edges.
 //
 // Motor spec: 8 PPR on motor shaft, 120:1 gearbox → 960 counts/output rev
 // X4:  3840 counts/output revolution.
 
 static volatile int32_t enc_count_left  = 0;
 static volatile int32_t enc_count_right = 0;
-static volatile uint32_t enc_irq_dbg    = 0;  // raw IRQ fire counter (debug)
-static volatile uint8_t enc_prev_state_left  = 0;
-static volatile uint8_t enc_prev_state_right = 0;
+static volatile uint32_t enc_irq_dbg    = 0;  // total transitions processed
 
-// Per-pin debounce timestamps (microseconds).
-// FIT0450 max: 160 RPM output × 120:1 = 19200 RPM motor shaft, 8 PPR → ~5120 edges/s/channel.
-// Minimum valid half-period ≈ 195 µs.  We gate at 50 µs to reject TXS0108E glitch bursts
-// while still passing all real encoder transitions up to ~5× rated max speed.
-#define ENC_DEBOUNCE_US  50u
-static volatile uint32_t enc_last_us[4] = {0, 0, 0, 0};  // LA, LB, RA, RB
+// PIO instance and state machine assignments
+static PIO  enc_pio      = pio0;
+#define ENC_SM_LEFT  0u
+#define ENC_SM_RIGHT 1u
 
-#define ENC_DIR_SIGN_LEFT   (1)
-#define ENC_DIR_SIGN_RIGHT  (1)
+// X4 quadrature transition table:  index = (prev_state << 2) | curr_state
+//   prev/curr state encoding: bit 0 = A, bit 1 = B
+static const int8_t enc_quad_table[16] = {
+     0, +1, -1,  0,   // prev=00: 00→00(0)  00→01(+1)  00→10(−1)  00→11(skip)
+    -1,  0,  0, +1,   // prev=01: 01→00(−1) 01→01(0)   01→10(skip) 01→11(+1)
+    +1,  0,  0, -1,   // prev=10: 10→00(+1) 10→01(skip) 10→10(0)  10→11(−1)
+     0, -1, +1,  0,   // prev=11: 11→00(skip) 11→01(−1) 11→10(+1) 11→11(0)
+};
 
-static inline int8_t quadrature_step(uint8_t prev_state, uint8_t curr_state) {
-    // Transition table for A=bit0, B=bit1. Invalid/skipped transitions return 0.
-    static const int8_t table[16] = {
-         0, +1, -1,  0,
-        -1,  0,  0, +1,
-        +1,  0,  0, -1,
-         0, -1, +1,  0,
-    };
-    return table[((prev_state & 0x3u) << 2) | (curr_state & 0x3u)];
-}
-
-static void encoder_irq_callback(uint gpio, uint32_t events) {
-    enc_irq_dbg++;   // always increment so we can see if IRQ fires at all
-
-    // Debounce: ignore edges that arrive faster than ENC_DEBOUNCE_US per pin.
-    uint idx;
-    if      (gpio == PIN_ENC_L_A) idx = 0;
-    else if (gpio == PIN_ENC_L_B) idx = 1;
-    else if (gpio == PIN_ENC_R_A) idx = 2;
-    else if (gpio == PIN_ENC_R_B) idx = 3;
-    else return;
-
-    uint32_t now = (uint32_t)time_us_32();
-    if ((now - enc_last_us[idx]) < ENC_DEBOUNCE_US) return;
-    enc_last_us[idx] = now;
-
-    bool a, b;
-    if (gpio == PIN_ENC_L_A || gpio == PIN_ENC_L_B) {
-        a = gpio_get(PIN_ENC_L_A);
-        b = gpio_get(PIN_ENC_L_B);
-        uint8_t state = (uint8_t)((a ? 0x01u : 0u) | (b ? 0x02u : 0u));
-        int8_t step = quadrature_step(enc_prev_state_left, state);
-        enc_prev_state_left = state;
-        enc_count_left += (int32_t)(ENC_DIR_SIGN_LEFT * step);
-    } else {
-        a = gpio_get(PIN_ENC_R_A);
-        b = gpio_get(PIN_ENC_R_B);
-        uint8_t state = (uint8_t)((a ? 0x01u : 0u) | (b ? 0x02u : 0u));
-        int8_t step = quadrature_step(enc_prev_state_right, state);
-        enc_prev_state_right = state;
-        enc_count_right += (int32_t)(ENC_DIR_SIGN_RIGHT * step);
+// PIO FIFO-not-empty ISR — drains both encoder FIFOs and updates counts.
+static void __isr pio_encoder_isr(void) {
+    // Left encoder (SM0)
+    while (!pio_sm_is_rx_fifo_empty(enc_pio, ENC_SM_LEFT)) {
+        uint32_t w = pio_sm_get(enc_pio, ENC_SM_LEFT);
+        enc_count_left += (int32_t)enc_quad_table[w & 0x0Fu];
+        enc_irq_dbg++;
+    }
+    // Right encoder (SM1)
+    while (!pio_sm_is_rx_fifo_empty(enc_pio, ENC_SM_RIGHT)) {
+        uint32_t w = pio_sm_get(enc_pio, ENC_SM_RIGHT);
+        enc_count_right += (int32_t)enc_quad_table[w & 0x0Fu];
+        enc_irq_dbg++;
     }
 }
 
 static void init_encoders(void) {
-    // Configure all four encoder input pins with internal pull-ups.
-    gpio_init(PIN_ENC_L_A); gpio_set_dir(PIN_ENC_L_A, GPIO_IN); gpio_pull_up(PIN_ENC_L_A);
-    gpio_init(PIN_ENC_L_B); gpio_set_dir(PIN_ENC_L_B, GPIO_IN); gpio_pull_up(PIN_ENC_L_B);
-    gpio_init(PIN_ENC_R_A); gpio_set_dir(PIN_ENC_R_A, GPIO_IN); gpio_pull_up(PIN_ENC_R_A);
-    gpio_init(PIN_ENC_R_B); gpio_set_dir(PIN_ENC_R_B, GPIO_IN); gpio_pull_up(PIN_ENC_R_B);
+    // Load the PIO quadrature program (shared by both state machines).
+    uint offset = pio_add_program(enc_pio, &quadrature_encoder_program);
 
-    enc_prev_state_left = (uint8_t)((gpio_get(PIN_ENC_L_A) ? 0x01u : 0u) |
-                                    (gpio_get(PIN_ENC_L_B) ? 0x02u : 0u));
-    enc_prev_state_right = (uint8_t)((gpio_get(PIN_ENC_R_A) ? 0x01u : 0u) |
-                                     (gpio_get(PIN_ENC_R_B) ? 0x02u : 0u));
+    // Left encoder:  GP16 (A), GP17 (B) — Grove 4
+    quadrature_encoder_program_init(enc_pio, ENC_SM_LEFT,  offset, PIN_ENC_L_A, 0);
+    // Right encoder: GP4  (A), GP5  (B) — Grove 3
+    quadrature_encoder_program_init(enc_pio, ENC_SM_RIGHT, offset, PIN_ENC_R_A, 0);
 
-    // SDK 2.x: set the shared GPIO IRQ callback FIRST, then enable edges on
-    // each pin.  Using gpio_set_irq_callback() (not _with_callback()) ensures the
-    // callback is registered exactly once and cannot be overwritten by board_init().
-    gpio_set_irq_callback(encoder_irq_callback);
-    gpio_set_irq_enabled(PIN_ENC_L_A, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
-    gpio_set_irq_enabled(PIN_ENC_L_B, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
-    gpio_set_irq_enabled(PIN_ENC_R_A, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
-    gpio_set_irq_enabled(PIN_ENC_R_B, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
-    // Explicitly enable the GPIO bank-0 IRQ on this core so it can't be missed.
-    irq_set_enabled(IO_IRQ_BANK0, true);
+    // Enable PIO RX-FIFO-not-empty interrupt for both SMs on PIO IRQ line 0.
+    pio_set_irq0_source_enabled(enc_pio,
+        (enum pio_interrupt_source)(pis_sm0_rx_fifo_not_empty + ENC_SM_LEFT), true);
+    pio_set_irq0_source_enabled(enc_pio,
+        (enum pio_interrupt_source)(pis_sm0_rx_fifo_not_empty + ENC_SM_RIGHT), true);
+    irq_set_exclusive_handler(PIO0_IRQ_0, pio_encoder_isr);
+    irq_set_enabled(PIO0_IRQ_0, true);
 }
 
 // ============================================================
@@ -2326,8 +2313,10 @@ static void update_odometry(float dt) {
         if (last_cmd_vel_us != 0 && last_host_comm_us != 0
             && (now - last_host_comm_us) < HOST_TIMEOUT_US) {
             lin_x = (float)r_i32(ADDR_CMD_LINEAR_X) / 100.0f;   // 0.01 m/s units → m/s
-            // Match ROS convention on the physical robot: +angular.z = left / CCW.
-            ang_z = -(float)r_i32(ADDR_CMD_ANGULAR_Z) / 100.0f; // 0.01 rad/s units → rad/s
+            // ROS convention: +angular.z = left / CCW.
+            // Differential drive: v_left = lin_x - ang_z*(sep/2), v_right = lin_x + ang_z*(sep/2)
+            // Positive ang_z → v_left < v_right → CCW rotation. No negation needed.
+            ang_z = (float)r_i32(ADDR_CMD_ANGULAR_Z) / 100.0f;  // 0.01 rad/s units → rad/s
         }
     }
 
@@ -2354,7 +2343,10 @@ static void update_odometry(float dt) {
             heading_hold_active = true;
         }
 
-        // Heading error from encoder differential (positive = drifted left/CCW)
+        // Heading error from encoder differential.
+        // Forward: positive enc_straight_diff → left wheel longer → robot drifted CW → error > 0.
+        // Reverse: both deltas are negative; left more negative → enc_straight_diff < 0 → error < 0.
+        // In both cases ang_z += correction has the correct sign (see comment below).
         float heading_err = enc_straight_diff / cfg_wheel_separation;
         w_f32(ADDR_DBG_HEADING_ERR, heading_err);
 
@@ -2373,13 +2365,37 @@ static void update_odometry(float dt) {
             if (heading_hold_iterm < -HEADING_HOLD_I_MAX) heading_hold_iterm = -HEADING_HOLD_I_MAX;
             correction += heading_hold_iterm;
 
-            // Output clamp — limit maximum angular correction
-            if (correction >  HEADING_HOLD_MAX_CORR) correction =  HEADING_HOLD_MAX_CORR;
-            if (correction < -HEADING_HOLD_MAX_CORR) correction = -HEADING_HOLD_MAX_CORR;
+            // Output clamp — direction-aware limit.
+            // In reverse the correction slows the STRONG motor to match the weak one,
+            // so a larger cap is safe and necessary to overcome larger motor asymmetry.
+            float max_corr = (lin_x < -0.005f) ? HEADING_HOLD_MAX_CORR_REV
+                                                : HEADING_HOLD_MAX_CORR;
+            if (correction >  max_corr) correction =  max_corr;
+            if (correction < -max_corr) correction = -max_corr;
 
-            // Positive heading_err means left wheel traveled more → robot
-            // drifted CCW.  Add correction to inject CW angular velocity
-            // (firmware ang_z is negated from ROS: positive → CW physical).
+            // Apply correction to ang_z.
+            //
+            // The sign of `correction` already encodes which direction to steer —
+            // no special-casing for reverse is needed.  Here is why:
+            //
+            //   enc_straight_diff = Σ(dl_m − dr_m)   (both terms signed)
+            //
+            // FORWARD (lin_x > 0):
+            //   Left faster  → signed_dl > signed_dr → enc_diff > 0 → correction > 0
+            //   → ang_z += positive → v_left = lin_x − ang*(sep/2) decreases (left slows) ✓
+            //   → v_right = lin_x + ang*(sep/2) increases (right speeds up)               ✓
+            //
+            // REVERSE (lin_x < 0):
+            //   Right faster backward → signed_dr more negative → dl_m > dr_m → enc_diff > 0
+            //   → correction > 0 → ang_z += positive
+            //   → v_right = lin_x + ang*(sep/2) = −0.1 + positive = less negative (slows) ✓
+            //   → v_left  = lin_x − ang*(sep/2) = −0.1 − positive = more negative (faster) ✓
+            //
+            //   Left faster backward  → enc_diff < 0 → correction < 0 → ang_z += negative
+            //   → v_left  = −0.1 − negative = less negative (left slows)  ✓
+            //   → v_right = −0.1 + negative = more negative (right faster) ✓
+            //
+            // The kinematics work out symmetrically — no sign flip required.
             ang_z += correction;
         }
         w_f32(ADDR_HEADING_HOLD_CORR, correction);
@@ -2452,7 +2468,7 @@ static void update_odometry(float dt) {
     // desired forward-positive convention.  Do NOT reuse the motor polarity
     // flags here, or odometry / measured wheel velocity will be inverted.
     // The swap flag affects which PWM slice drives which motor, but the encoder
-    // wiring (Grove 3 → left encoder, Grove 4 → right encoder) never changes.
+    // wiring (Grove 4 → left encoder, Grove 3 → right encoder) never changes.
     float signed_dl = (float)delta_enc_l;
     float signed_dr = (float)delta_enc_r;
 
@@ -2708,11 +2724,12 @@ static void update_sensors(uint64_t now_us) {
         enc_count_left  = 0;
         enc_count_right = 0;
         enc_irq_dbg     = 0;
-        enc_last_us[0] = enc_last_us[1] = enc_last_us[2] = enc_last_us[3] = 0;
-        enc_prev_state_left = (uint8_t)((gpio_get(PIN_ENC_L_A) ? 0x01u : 0u) |
-                                        (gpio_get(PIN_ENC_L_B) ? 0x02u : 0u));
-        enc_prev_state_right = (uint8_t)((gpio_get(PIN_ENC_R_A) ? 0x01u : 0u) |
-                                         (gpio_get(PIN_ENC_R_B) ? 0x02u : 0u));
+        // Drain any pending PIO FIFO entries so stale transitions don't
+        // immediately re-increment the zeroed counters.
+        while (!pio_sm_is_rx_fifo_empty(enc_pio, ENC_SM_LEFT))
+            (void)pio_sm_get(enc_pio, ENC_SM_LEFT);
+        while (!pio_sm_is_rx_fifo_empty(enc_pio, ENC_SM_RIGHT))
+            (void)pio_sm_get(enc_pio, ENC_SM_RIGHT);
         restore_interrupts(saved);
     }
     // Snapshot encoder counts + debug counter atomically and push to register table.
@@ -2796,8 +2813,9 @@ int main(void) {
     board_init();
     tud_init(0);
 
-    // Init encoders AFTER board_init/tud_init so our GPIO IRQ callback is
-    // registered last and cannot be overwritten by TinyUSB BSP init.
+    // Init PIO quadrature encoders.  PIO has its own IRQ line (PIO0_IRQ_0),
+    // independent of GPIO Bank0 IRQs, so order relative to board_init() is
+    // not critical — but we keep it here for consistency.
     init_encoders();
 
     // Play the startup melody (same ascending arpeggio as real TurtleBot3 OpenCR)

@@ -2,21 +2,20 @@
 """
 calibrate_distance.py — Ultrasonic-based wheel-radius calibration for TurtleBot3.
 
-Uses one or two front-facing Grove Ultrasonic Ranger V2.0 sensors (connected to
-Grove 2 / Grove 3 on the Cytron Robo Pico) to obtain ground-truth forward
-distance measurements.  The robot drives toward a flat wall, and the difference
-between ultrasonic readings before and after the move gives the actual distance
-traveled.  This is compared with ROS odometry to compute a wheel_radius
-correction factor.
+Uses one or two front-facing Grove Ultrasonic Ranger V2.0 sensors connected
+directly to Raspberry Pi GPIO pins (default: GPIO23=left, GPIO24=right) to
+obtain ground-truth forward distance measurements.  The robot drives toward a
+flat wall, and the difference between ultrasonic readings before and after the
+move gives the actual distance traveled.  This is compared with ROS odometry to
+compute a wheel_radius correction factor.
 
 Workflow (per pass):
-  1. Enable ultrasonic sensors via Dynamixel register write (ADDR_USS_ENABLE)
-  2. Read initial ultrasonic distance(s)
-  3. Record initial odometry position
-  4. Drive forward at low speed until target distance is reached
-  5. Stop and settle, read final ultrasonic distance(s)
-  6. Compute: correction = uss_delta / odom_delta
-  7. Adjust WHEEL_RADIUS ← current_radius × correction
+  1. Read initial ultrasonic distance(s) from Pi GPIO
+  2. Record initial odometry position
+  3. Drive forward at low speed until target distance is reached
+  4. Stop and settle, read final ultrasonic distance(s)
+  5. Compute: correction = uss_delta / odom_delta
+  6. Adjust WHEEL_RADIUS ← current_radius × correction
 
 After all passes, the averaged correction is applied via the runtime
 calibration instruction (0x90 SET) and optionally persisted to flash and
@@ -29,8 +28,8 @@ Safety:
 
 Requirements:
   • ROS 2 bringup running (/odom topic active)
-  • Firmware with ultrasonic support (ADDR_USS_ENABLE register)
-  • At least one Grove Ultrasonic Ranger V2.0 connected
+  • RPi.GPIO (python3-rpi-lgpio) installed on the Raspberry Pi
+  • At least one Grove Ultrasonic Ranger V2.0 connected to a Pi GPIO pin
 
 Usage:
   # Dry-run (measure and report only):
@@ -61,6 +60,15 @@ from typing import Optional
 
 import serial
 
+try:
+    import RPi.GPIO as GPIO_MOD
+    GPIO_MOD.setwarnings(False)
+    GPIO_MOD.setmode(GPIO_MOD.BCM)
+    _GPIO_AVAILABLE = True
+except Exception:
+    _GPIO_AVAILABLE = False
+    GPIO_MOD = None  # type: ignore
+
 import rclpy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
@@ -83,12 +91,6 @@ MAIN_C       = SCRIPT_DIR / "firmware" / "main.c"
 DEV_ID       = 200
 DXL_BAUD     = 1_000_000
 
-# Dynamixel register addresses (must match firmware/main.c)
-ADDR_USS_ENABLE     = 184   # 1 byte: bit0=USS1, bit1=USS2
-ADDR_USS_STATUS     = 185   # 1 byte: bit0=USS1 valid, bit1=USS2 valid, bit4/5=timeout
-ADDR_USS_1_DIST_MM  = 186   # uint16: sensor 1 distance (mm)
-ADDR_USS_2_DIST_MM  = 188   # uint16: sensor 2 distance (mm)
-
 # Runtime calibration (custom instruction 0x90)
 INST_CALIBRATION = 0x90
 CALIB_CMD_SET    = 0x01
@@ -97,10 +99,14 @@ CALIB_CMD_SAVE   = 0x04
 
 CALIB_KEY_WHEEL_RADIUS = 0x01
 
-USS_INVALID = 0xFFFF
+# Pi GPIO ultrasonic sensor defaults
+DEFAULT_LEFT_GPIO   = 23        # BCM GPIO for left  Grove Ultrasonic
+DEFAULT_RIGHT_GPIO  = 24        # BCM GPIO for right Grove Ultrasonic
+USS_TIMEOUT_US       = 30000     # echo timeout in microseconds
+INTER_SENSOR_GAP     = 0.05      # seconds between triggering left/right
 
 # Defaults
-DEFAULT_PORT         = "/dev/ttyACM0"
+DEFAULT_PORT         = "/dev/ttyTB3"
 DEFAULT_DISTANCE_M   = 0.15      # target travel per pass (m)
 DEFAULT_SPEED        = 0.04      # forward speed (m/s)
 DEFAULT_PASSES       = 3
@@ -117,6 +123,54 @@ YLW = "\033[1;33m"
 CYN = "\033[0;36m"
 BLD = "\033[1m"
 NC  = "\033[0m"
+
+
+# ── Pi GPIO ultrasonic helpers ────────────────────────────────────────────────
+
+def pi_uss_read_mm(gpio: int, timeout_us: int = USS_TIMEOUT_US) -> Optional[float]:
+    """Read one Grove Ultrasonic sensor on a Pi GPIO pin.  Returns mm or None."""
+    if not _GPIO_AVAILABLE:
+        return None
+    try:
+        GPIO_MOD.setup(gpio, GPIO_MOD.OUT, initial=GPIO_MOD.LOW)
+        time.sleep(2e-6)
+        GPIO_MOD.output(gpio, GPIO_MOD.HIGH)
+        time.sleep(10e-6)
+        GPIO_MOD.output(gpio, GPIO_MOD.LOW)
+
+        GPIO_MOD.setup(gpio, GPIO_MOD.IN)
+
+        start_ns = time.perf_counter_ns()
+        timeout_ns = int(timeout_us * 1000)
+        while GPIO_MOD.input(gpio) == 0:
+            if (time.perf_counter_ns() - start_ns) > timeout_ns:
+                return None
+
+        rise_ns = time.perf_counter_ns()
+        while GPIO_MOD.input(gpio) == 1:
+            if (time.perf_counter_ns() - rise_ns) > timeout_ns:
+                return None
+
+        fall_ns = time.perf_counter_ns()
+        pulse_us = (fall_ns - rise_ns) / 1000.0
+        distance_mm = (pulse_us * 10.0) / 58.0
+
+        if distance_mm < 20.0 or distance_mm > 3500.0:
+            return None
+        return distance_mm
+    except Exception:
+        return None
+
+
+def pi_uss_cleanup(gpios: list[int]) -> None:
+    """Release GPIO pins."""
+    if not _GPIO_AVAILABLE:
+        return
+    for g in gpios:
+        try:
+            GPIO_MOD.cleanup(g)
+        except Exception:
+            pass
 
 
 # ── Dynamixel Protocol 2.0 helpers ───────────────────────────────────────────
@@ -265,25 +319,7 @@ class DxlPort:
         self.ser.flush()
         time.sleep(0.10)
 
-    def uss_enable(self, mask: int) -> bool:
-        """Enable ultrasonic sensors (bit 0 = USS1, bit 1 = USS2)."""
-        return self.write_reg(ADDR_USS_ENABLE, bytes([mask & 0x03]))
 
-    def uss_disable(self) -> bool:
-        return self.write_reg(ADDR_USS_ENABLE, bytes([0x00]))
-
-    def uss_read_mm(self, sensor: int) -> Optional[int]:
-        """Read one ultrasonic sensor distance in mm.  Returns None on timeout."""
-        addr = ADDR_USS_1_DIST_MM if sensor == 1 else ADDR_USS_2_DIST_MM
-        data = self.read_reg(addr, 2)
-        if data is None:
-            return None
-        val = struct.unpack('<H', data)[0]
-        return None if val == USS_INVALID else val
-
-    def uss_status(self) -> Optional[int]:
-        data = self.read_reg(ADDR_USS_STATUS, 1)
-        return data[0] if data else None
 
 
 # ── source file helpers ───────────────────────────────────────────────────────
@@ -363,14 +399,14 @@ class DistanceCalibNode(Node):
 
 # ── measurement helpers ───────────────────────────────────────────────────────
 
-def read_uss_averaged(dxl: DxlPort, sensor: int, node: DistanceCalibNode,
+def read_uss_averaged(gpio_pin: int, node: DistanceCalibNode,
                       num_samples: int = USS_READ_SAMPLES,
                       interval: float = USS_READ_INTERVAL) -> Optional[float]:
-    """Read `num_samples` ultrasonic readings, discard outliers, return mean mm."""
-    readings: list[int] = []
+    """Read `num_samples` ultrasonic readings from a Pi GPIO, discard outliers, return mean mm."""
+    readings: list[float] = []
     for _ in range(num_samples):
         node.spin_ros(interval)
-        val = dxl.uss_read_mm(sensor)
+        val = pi_uss_read_mm(gpio_pin)
         if val is not None:
             readings.append(val)
 
@@ -387,40 +423,45 @@ def read_uss_averaged(dxl: DxlPort, sensor: int, node: DistanceCalibNode,
     return sum(filtered) / len(filtered)
 
 
-def read_both_uss(dxl: DxlPort, sensors: list[int], node: DistanceCalibNode,
+def read_both_uss(sensor_gpios: dict[int, int], node: DistanceCalibNode,
                   num_samples: int = USS_READ_SAMPLES) -> dict[int, Optional[float]]:
-    """Read averaging for each enabled sensor."""
+    """Read averaging for each enabled sensor via Pi GPIO."""
     results = {}
-    for s in sensors:
-        results[s] = read_uss_averaged(dxl, s, node, num_samples)
+    for s, gpio_pin in sensor_gpios.items():
+        results[s] = read_uss_averaged(gpio_pin, node, num_samples)
+        if len(sensor_gpios) > 1:
+            time.sleep(INTER_SENSOR_GAP)
     return results
 
 
 # ── main calibration ─────────────────────────────────────────────────────────
 
-def run_monitor(dxl: DxlPort, node: DistanceCalibNode, sensors: list[int]):
-    """Continuously print ultrasonic readings (Ctrl-C to exit)."""
-    enable_mask = sum(1 << (s - 1) for s in sensors)
-    dxl.uss_enable(enable_mask)
-    time.sleep(0.5)
-    print(f"\n{BLD}Live ultrasonic monitor{NC}  (Ctrl-C to exit)\n")
+def run_monitor(sensor_gpios: dict[int, int], node: DistanceCalibNode):
+    """Continuously print ultrasonic readings from Pi GPIO (Ctrl-C to exit)."""
+    print(f"\n{BLD}Live ultrasonic monitor (Pi GPIO){NC}  (Ctrl-C to exit)\n")
     try:
         while True:
             parts = []
-            for s in sensors:
-                val = dxl.uss_read_mm(s)
+            for s, gpio_pin in sensor_gpios.items():
+                val = pi_uss_read_mm(gpio_pin)
                 if val is not None:
-                    parts.append(f"USS{s}: {val:5d} mm ({val/10:.1f} cm)")
+                    parts.append(f"USS{s}(GPIO{gpio_pin}): {val:7.1f} mm ({val/10:.1f} cm)")
                 else:
-                    parts.append(f"USS{s}: ----  (timeout)")
-            status = dxl.uss_status()
-            print(f"  {' | '.join(parts)}  [status=0x{status:02X}]" if status is not None
-                  else f"  {' | '.join(parts)}", end="\r")
+                    parts.append(f"USS{s}(GPIO{gpio_pin}): ----  (timeout)")
+                if len(sensor_gpios) > 1:
+                    time.sleep(INTER_SENSOR_GAP)
+            print(f"  {' | '.join(parts)}", end="\r")
             node.spin_ros(0.15)
     except KeyboardInterrupt:
         print("\n")
     finally:
-        dxl.uss_disable()
+        pi_uss_cleanup(list(sensor_gpios.values()))
+
+
+def _build_sensor_gpios(sensors: list[int], left_gpio: int, right_gpio: int) -> dict[int, int]:
+    """Map sensor IDs (1=left, 2=right) to BCM GPIO pin numbers."""
+    mapping = {1: left_gpio, 2: right_gpio}
+    return {s: mapping[s] for s in sensors if s in mapping}
 
 
 def run_calibration(args):
@@ -432,24 +473,29 @@ def run_calibration(args):
     wall_stop_mm = args.wall_stop
     apply = args.apply
     sensors = [int(s) for s in args.sensor.split(",")]
+    sensor_gpios = _build_sensor_gpios(sensors, args.left_gpio, args.right_gpio)
 
-    print(f"\n{BLD}=== Ultrasonic Distance Calibration ==={NC}")
+    if not _GPIO_AVAILABLE:
+        print(f"{RED}ERROR:{NC} RPi.GPIO is not available.")
+        print("  Install with: sudo apt install python3-rpi-lgpio")
+        sys.exit(2)
+
+    print(f"\n{BLD}=== Ultrasonic Distance Calibration (Pi GPIO) ==={NC}")
     print(f"  Port:       {port_path}")
-    print(f"  Sensors:    {sensors}")
+    print(f"  Sensors:    {sensors}  (GPIOs: {sensor_gpios})")
     print(f"  Target:     {target_dist_m:.3f} m per pass")
     print(f"  Speed:      {speed:.3f} m/s")
     print(f"  Passes:     {n_passes}")
     print(f"  Wall stop:  {wall_stop_mm} mm")
     print(f"  Apply:      {'yes' if apply else 'dry-run'}\n")
 
-    # --- Open Dynamixel port ---
+    # --- Open Dynamixel port (for calibration read/write only) ---
+    dxl: Optional[DxlPort] = None
     try:
         dxl = DxlPort(port_path)
     except serial.SerialException as e:
-        print(f"{RED}ERROR:{NC} Cannot open {port_path}: {e}")
-        print("  Is the Pico connected?  Is bringup NOT running?")
-        print("  (This script needs exclusive serial access.)")
-        sys.exit(2)
+        print(f"{YLW}WARN:{NC} Cannot open {port_path}: {e}")
+        print("  Calibration values will be read from source only.")
 
     # --- Init ROS ---
     rclpy.init()
@@ -464,29 +510,23 @@ def run_calibration(args):
         print(f" {GRN}OK{NC}")
 
         # --- Read current wheel_radius ---
-        current_radius = dxl.calib_get(CALIB_KEY_WHEEL_RADIUS)
+        current_radius = None
+        if dxl is not None:
+            current_radius = dxl.calib_get(CALIB_KEY_WHEEL_RADIUS)
         if current_radius is None:
-            # Fallback: read from source
             current_radius = read_define_float(MAIN_C, "WHEEL_RADIUS_DEFAULT")
         if current_radius is None:
             current_radius = 0.03405  # TurtleBot3 Burger default
         print(f"  Current WHEEL_RADIUS = {current_radius:.6f} m")
 
-        # --- Enable ultrasonic sensors ---
-        enable_mask = sum(1 << (s - 1) for s in sensors)
-        if not dxl.uss_enable(enable_mask):
-            print(f"{YLW}WARN:{NC} USS enable write did not get ACK (may still work)")
-        time.sleep(1.0)  # wait for first readings to populate
-
-        # Verify sensors are responding
-        for s in sensors:
-            val = dxl.uss_read_mm(s)
+        # --- Verify Pi GPIO ultrasonic sensors are responding ---
+        for s, gpio_pin in sensor_gpios.items():
+            val = pi_uss_read_mm(gpio_pin)
             if val is None:
-                print(f"{RED}ERROR:{NC} Ultrasonic sensor {s} returns no reading.")
-                print(f"  Check wiring: sensor {s} → Grove {'2' if s == 1 else '3'} "
-                      f"on Robo Pico")
+                print(f"{RED}ERROR:{NC} Ultrasonic sensor {s} (GPIO{gpio_pin}) returns no reading.")
+                print(f"  Check wiring: sensor {s} → GPIO{gpio_pin} on Raspberry Pi")
                 sys.exit(2)
-            print(f"  USS{s} initial reading: {val} mm ({val/10:.1f} cm)")
+            print(f"  USS{s} (GPIO{gpio_pin}) initial reading: {val:.1f} mm ({val/10:.1f} cm)")
 
         # --- Run calibration passes ---
         corrections: list[float] = []
@@ -496,7 +536,7 @@ def run_calibration(args):
 
             # 1. Read initial ultrasonic distance
             print(f"  Reading initial distances …")
-            d_before = read_both_uss(dxl, sensors, node)
+            d_before = read_both_uss(sensor_gpios, node)
             for s in sensors:
                 if d_before[s] is None:
                     print(f"  {RED}USS{s}: no valid reading — skip pass{NC}")
@@ -516,7 +556,7 @@ def run_calibration(args):
                       f"{target_dist_m*1000:.0f} mm travel.  Move robot back.{NC}")
                 input(f"  Press Enter when ready, or Ctrl-C to abort … ")
                 # Re-read
-                d_before = read_both_uss(dxl, sensors, node)
+                d_before = read_both_uss(sensor_gpios, node)
                 valid_sensors = [s for s in sensors if d_before[s] is not None]
 
             # 2. Record initial odometry
@@ -537,10 +577,10 @@ def run_calibration(args):
 
                 # Safety: check ultrasonic distance during drive
                 for s in valid_sensors:
-                    d_now = dxl.uss_read_mm(s)
+                    d_now = pi_uss_read_mm(sensor_gpios[s])
                     if d_now is not None and d_now < wall_stop_mm:
                         node.stop(0.5)
-                        print(f"\n  {RED}WALL STOP:{NC} USS{s}={d_now} mm < "
+                        print(f"\n  {RED}WALL STOP:{NC} USS{s}={d_now:.0f} mm < "
                               f"{wall_stop_mm} mm")
                         break
 
@@ -559,7 +599,7 @@ def run_calibration(args):
 
             # 5. Read final ultrasonic distance
             print(f"  Reading final distances …")
-            d_after = read_both_uss(dxl, sensors, node)
+            d_after = read_both_uss(sensor_gpios, node)
 
             pass_corrections = []
             for s in valid_sensors:
@@ -599,7 +639,6 @@ def run_calibration(args):
         # --- Aggregate results ---
         if not corrections:
             print(f"\n{RED}No valid correction factors obtained.{NC}")
-            dxl.uss_disable()
             return
 
         # Remove outliers  
@@ -629,19 +668,21 @@ def run_calibration(args):
                   f"perpendicular to wall.")
             print(f"  Skipping auto-apply.  Re-run with --apply to force.\n")
             if not args.force:
-                dxl.uss_disable()
                 return
 
         if apply:
             print(f"\n  Applying WHEEL_RADIUS = {new_radius:.6f} …")
 
-            # Runtime
-            dxl.calib_set(CALIB_KEY_WHEEL_RADIUS, new_radius)
-            print(f"    {GRN}✓{NC} Runtime updated")
+            if dxl is not None:
+                # Runtime
+                dxl.calib_set(CALIB_KEY_WHEEL_RADIUS, new_radius)
+                print(f"    {GRN}✓{NC} Runtime updated")
 
-            # Flash
-            dxl.calib_save()
-            print(f"    {GRN}✓{NC} Saved to flash")
+                # Flash
+                dxl.calib_save()
+                print(f"    {GRN}✓{NC} Saved to flash")
+            else:
+                print(f"    {YLW}⚠{NC} No serial connection — skipping runtime/flash update")
 
             # Source
             try:
@@ -661,8 +702,9 @@ def run_calibration(args):
         print(f"\n{YLW}Interrupted.{NC}")
         node.stop(0.3)
     finally:
-        dxl.uss_disable()
-        dxl.close()
+        pi_uss_cleanup(list(sensor_gpios.values()))
+        if dxl is not None:
+            dxl.close()
         node.destroy_node()
         rclpy.shutdown()
 
@@ -671,9 +713,13 @@ def run_calibration(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Ultrasonic-based wheel-radius calibration for TurtleBot3")
+        description="Ultrasonic-based wheel-radius calibration for TurtleBot3 (Pi GPIO)")
     parser.add_argument("--port", default=DEFAULT_PORT,
-                        help=f"serial port (default: {DEFAULT_PORT})")
+                        help=f"serial port for calibration read/write (default: {DEFAULT_PORT})")
+    parser.add_argument("--left-gpio", type=int, default=DEFAULT_LEFT_GPIO,
+                        help=f"BCM GPIO for left ultrasonic sensor (default: {DEFAULT_LEFT_GPIO})")
+    parser.add_argument("--right-gpio", type=int, default=DEFAULT_RIGHT_GPIO,
+                        help=f"BCM GPIO for right ultrasonic sensor (default: {DEFAULT_RIGHT_GPIO})")
     parser.add_argument("--distance", type=float, default=DEFAULT_DISTANCE_M,
                         help=f"travel distance per pass in metres (default: {DEFAULT_DISTANCE_M})")
     parser.add_argument("--speed", type=float, default=DEFAULT_SPEED,
@@ -683,7 +729,7 @@ def main():
     parser.add_argument("--wall-stop", type=int, default=DEFAULT_WALL_STOP_MM,
                         help=f"minimum wall distance in mm (default: {DEFAULT_WALL_STOP_MM})")
     parser.add_argument("--sensor", default="1,2",
-                        help="sensor(s) to use: '1', '2', or '1,2' (default: 1,2)")
+                        help="sensor(s) to use: '1' (left), '2' (right), or '1,2' (default: 1,2)")
     parser.add_argument("--apply", action="store_true",
                         help="apply correction to runtime + flash + source")
     parser.add_argument("--force", action="store_true",
@@ -692,20 +738,21 @@ def main():
                         help="live-print ultrasonic readings (no calibration)")
     args = parser.parse_args()
 
+    if not _GPIO_AVAILABLE:
+        print(f"{RED}ERROR:{NC} RPi.GPIO is not available.")
+        print("  Install with: sudo apt install python3-rpi-lgpio")
+        sys.exit(2)
+
+    sensors = [int(s) for s in args.sensor.split(",")]
+    sensor_gpios = _build_sensor_gpios(sensors, args.left_gpio, args.right_gpio)
+
     if args.monitor:
         rclpy.init()
         node = DistanceCalibNode()
-        sensors = [int(s) for s in args.sensor.split(",")]
         try:
-            dxl = DxlPort(args.port)
-        except serial.SerialException as e:
-            print(f"{RED}ERROR:{NC} Cannot open {args.port}: {e}")
-            sys.exit(2)
-        try:
-            run_monitor(dxl, node, sensors)
+            run_monitor(sensor_gpios, node)
         finally:
-            dxl.uss_disable()
-            dxl.close()
+            pi_uss_cleanup(list(sensor_gpios.values()))
             node.destroy_node()
             rclpy.shutdown()
     else:

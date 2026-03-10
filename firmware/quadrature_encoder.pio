@@ -1,119 +1,128 @@
-; quadrature_encoder.pio — PIO-based X4 quadrature decoder for RP2350
 ;
-; Each state machine tracks one encoder (A on pin_base, B on pin_base+1).
-; The running count is kept in the X scratch register.
-; The CPU reads X atomically — no interrupt overhead, no debounce needed.
+; quadrature_encoder.pio — PIO-based X4 quadrature decoder for RP2350 (Pico 2)
 ;
-; Encoding: A = bit 0, B = bit 1 of the 2-bit state.
-; The ISR register holds the previous 2-bit state in bits [1:0].
+; One state machine per encoder channel.
+;   pin_base     = channel A
+;   pin_base + 1 = channel B
 ;
-; X4 quadrature truth table:
-;   prev  curr  step
-;   00    01    +1
-;   00    10    -1
-;   01    00    -1
-;   01    11    +1
-;   10    00    +1
-;   10    11    -1
-;   11    01    -1
-;   11    10    +1
-;   (same→same = 0, skip = 0)
+; On every confirmed state transition, pushes one 32-bit word to the RX FIFO:
+;   bits [3:2] = previous state {B_old, A_old}
+;   bits [1:0] = current  state {B_new, A_new}
 ;
-; The PIO program samples the pins, XORs with the previous state to detect
-; changes, and uses JMP tables to determine direction.
+; The C-side IRQ handler drains the FIFO and updates a counter via a 16-entry
+; lookup table — identical to the X4 quadrature truth table.
+;
+; Glitch rejection
+; ────────────────
+; A state change must be confirmed by two consecutive identical samples before
+; it is accepted.  At 5 MHz SM clock (200 ns per instruction), any glitch
+; shorter than ~0.8 µs is transparently rejected.  This is more than sufficient
+; for TXS0108E level-shifter ringing (typically <100 ns) without any software
+; debounce and without the risk of dropping real encoder edges at speed.
+;
+; Timing (5 MHz SM clock, 200 ns/instruction)
+; ────────────────────────────────────────────
+;   No-change poll loop : 4 cycles =  0.8 µs  (effective sample rate ~1.25 MHz)
+;   Confirmed transition: 14 cycles = 2.8 µs  (processing overhead per edge)
+;   Rejected glitch     :  9 cycles = 1.8 µs
+;
+;   FIT0450 max edge rate at 160 RPM: ~20 kHz → one edge every 50 µs.
+;   Headroom factor: 50 / 2.8 ≈ 18×.
+;
+; Register usage
+; ──────────────
+;   Y   = confirmed previous pin state {B, A} in bits [1:0]
+;   X   = temporary: current pin reading
+;   ISR = temporary: pin reads and transition word assembly
+;   OSR = (unused)
+;
 
 .program quadrature_encoder
-.origin -1              ; allow the assembler to place it anywhere
 
-; ──── Initialisation (runs once) ────────────────────────────────────────────
-; Read starting pin state into ISR (previous state).
-    in pins, 2          ; ISR ← {B, A}  (autopush disabled, so stays in ISR)
-    mov y, isr          ; Y ← current state (Y is our "previous state" register)
-    mov isr, null       ; clear ISR for cleanliness
+    ; ──── Initialisation (runs once) ────────────────────────────────────────
+    ; Read starting pin state into Y (previous state register).
+    in    pins, 2           ; ISR[1:0] = {B, A}
+    mov   y, isr            ; Y = initial confirmed state
+    mov   isr, null         ; clear ISR
 
-; ──── Main loop ─────────────────────────────────────────────────────────────
+    ; ──── Main polling loop ─────────────────────────────────────────────────
 .wrap_target
-sample:
-    mov isr, null       ; clear ISR
-    in pins, 2          ; ISR ← current {B, A}
-    mov x, isr          ; X temporarily = current state
-    jmp x!=y changed    ; if state differs from previous, process it
-    jmp sample          ; state unchanged — poll again
+loop:
+    in    pins, 2           ; [1] ISR = current {B, A}  (ISR was 0 → ISR = pins)
+    mov   x, isr            ; [2] X = current state
+    mov   isr, null         ; [3] clear ISR for next iteration
+    jmp   x!=y changed      ; [4] state differs from previous?
+.wrap                        ; no change — hardware wraps to loop (0 extra cycles)
+
+    ; ──── State changed — confirm with a second sample ──────────────────────
 changed:
-    ; We need to determine direction from (prev=Y, curr=X).
-    ;
-    ; Strategy: compute XOR(prev, curr).  For valid single-step transitions:
-    ;   If only A changed (XOR bit0=1, bit1=0): direction = curr_B XOR curr_A
-    ;   If only B changed (XOR bit0=0, bit1=1): direction = curr_A XOR curr_B XOR 1
-    ;
-    ; Simpler approach: use a tiny lookup via conditional jumps.
-    ; prev is in Y (2 bits), curr is in X (2 bits).
-    ; We use scratch registers creatively.
-    ;
-    ; Method: compute (prev << 2 | curr) as 4-bit index, then branch.
-    ; But PIO lacks shift-and-OR.  Instead, we use direct state comparisons:
+    in    pins, 2           ; [5] second sample
+    mov   x, isr            ; [6] X = second reading
+    mov   isr, null         ; [7] clear ISR
+    jmp   x!=y confirmed    ; [8] still different from Y (previous)?  → real
+    jmp   loop              ; [9] reverted to previous → glitch, discard
 
-    ; Save current state as new "previous" for next iteration FIRST.
-    mov osr, y          ; OSR ← old prev (save for comparison below)
-    mov y, x            ; Y ← current state (becomes new prev)
+    ; ──── Confirmed transition — assemble and push ──────────────────────────
+confirmed:
+    in    y, 2              ; [10] ISR = 0..0 | prev[1:0]      (prev in low bits)
+    in    x, 2              ; [11] ISR = 0..0 | prev[1:0] << 2 | curr[1:0]
+    push  noblock           ; [12] send (prev<<2 | curr) to RX FIFO
+    mov   isr, null         ; [13] clear ISR so next loop iteration starts clean
+    mov   y, x              ; [14] update Y = confirmed new state
+    jmp   loop              ; [15] back to polling
 
-    ; Now: OSR = old prev, X = current state.  Determine step direction.
-    ; We encode prev in OSR and test using JMP on pin values.
-    ;
-    ; Approach: XOR prev^curr to find which bit changed, then determine sign.
-    ; PIO has no XOR instruction.  We use a small dispatch table on prev state.
-
-    ; Read prev from OSR back into X for comparison
-    mov x, osr          ; X = prev state
-    jmp !x prev_00      ; prev == 00?
-    mov x, osr
-    set isr, 1
-    mov isr, ::isr      ; not available — let's use a different approach
-
-    ; Actually, let's use the definitive approach: read pins again is fine since
-    ; state just changed. We dispatch on prev (in OSR).  We only need the 2 LSBs.
-
-    ; Re-think: use the simplest proven PIO quadrature approach.
 
 % c-sdk {
-
-// ──────────────────────────────────────────────────────────────────────────────
-// C helper: configure and start a PIO state machine for quadrature decoding.
-// ──────────────────────────────────────────────────────────────────────────────
 
 #include "hardware/clocks.h"
 #include "hardware/gpio.h"
 
+/**
+ * Initialise one PIO state machine for X4 quadrature decoding.
+ *
+ * @param pio           PIO instance (pio0, pio1, or pio2 on RP2350)
+ * @param sm            State machine index (0–3)
+ * @param offset        Instruction memory offset from pio_add_program()
+ * @param pin_A         GPIO number of encoder channel A; channel B MUST be pin_A+1
+ * @param max_step_freq Maximum expected quadrature edge rate (Hz).
+ *                      The SM clock is set to 4× this (4 instructions per poll).
+ *                      Pass 0 for the default 5 MHz SM clock (~1.25 MHz sample rate).
+ */
 static inline void quadrature_encoder_program_init(
-    PIO pio, uint sm, uint offset, uint pin_A, float sample_freq_hz)
+    PIO pio, uint sm, uint offset, uint pin_A, uint max_step_freq)
 {
-    // Pin A and pin B (= pin_A + 1) are inputs.
+    pio_sm_config c = quadrature_encoder_program_get_default_config(offset);
+
+    /* IN reads from pin_A (B is automatically pin_A+1) */
+    sm_config_set_in_pins(&c, pin_A);
+
+    /* ISR shifts LEFT, no autopush — we push manually */
+    sm_config_set_in_shift(&c, false, false, 32);
+
+    /* Join TX FIFO into RX → 8 entries deep (we never transmit) */
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    /* SM clock divider.  Default: 5 MHz on a 150 MHz RP2350 → div = 30. */
+    float sys_hz = (float)clock_get_hz(clk_sys);
+    float sm_hz;
+    if (max_step_freq > 0) {
+        sm_hz = (float)max_step_freq * 4.0f;
+        if (sm_hz > sys_hz) sm_hz = sys_hz;
+    } else {
+        sm_hz = 5000000.0f;
+    }
+    sm_config_set_clkdiv(&c, sys_hz / sm_hz);
+
+    /* Configure encoder pins as PIO inputs with pull-ups */
     pio_sm_set_consecutive_pindirs(pio, sm, pin_A, 2, false);
     pio_gpio_init(pio, pin_A);
     pio_gpio_init(pio, pin_A + 1);
-
-    // Enable pull-ups on both pins.
     gpio_pull_up(pin_A);
     gpio_pull_up(pin_A + 1);
 
-    pio_sm_config c = quadrature_encoder_program_get_default_config(offset);
-    sm_config_set_in_pins(&c, pin_A);     // IN reads from pin_A
-    sm_config_set_jmp_pin(&c, pin_A);     // JMP PIN tests pin_A
-
-    // Clock divider to set sample rate; typical: 1 MHz (1 µs per instruction).
-    float div = (float)clock_get_hz(clk_sys) / sample_freq_hz;
-    sm_config_set_clkdiv(&c, div);
-
-    // No autopush / autopull
-    sm_config_set_in_shift(&c, false, false, 32);
-
+    /* Initialise and start */
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
 }
 
 %}
-.wrap
-
-
-; The above attempt is getting too complex with the branching approach.
-; Let me use the PROVEN table-lookup method from the pico-examples.
