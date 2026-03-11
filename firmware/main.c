@@ -169,8 +169,8 @@
 // Gains are in throttle [−1,1] per (m/s) error units.
 // Default values match OpenCR Kp=0.45, Ki=0.6 (duty 0–255 @ ≈160RPM max)
 // translated to [0,1] duty @ 0.55 m/s max.
-#define PID_KP_DEFAULT   1.5f   // proportional to Δerror
-#define PID_KI_DEFAULT   8.0f   // integral: raised for fast convergence (~0.5 s to target)
+#define PID_KP_DEFAULT   1.0f   // proportional to Δerror (reduced from 1.5; with velocity filter, less aggressive tracking helps)
+#define PID_KI_DEFAULT   4.0f   // integral: sweet spot with 5 Hz velocity filter (3.0 too slow, 5.0+ introduces wobble)
 #define PID_KD_DEFAULT   0.0f   // derivative (typically 0 for velocity PID)
 #define PID_OUTPUT_MAX   1.0f   // clamp on PID output accumulator
 
@@ -179,10 +179,10 @@
 // (L−R distance / wheel_separation) keeps the robot driving straight.
 // Uses encoder feedback instead of gyro to avoid BNO055 vibration-rectification bias.
 // Units: rad/s angular velocity correction per radian heading error.
-#define HEADING_HOLD_KP_DEFAULT   4.0f   // P gain — fast correction: 7.6mm enc_diff saturates at MAX_CORR
-#define HEADING_HOLD_KI_DEFAULT   0.5f   // I gain — eliminates persistent motor asymmetry bias in ~2 s
+#define HEADING_HOLD_KP_DEFAULT   1.0f   // P gain — reduced from 4.0→2.0→1.0 to stay below inner PID bandwidth
+#define HEADING_HOLD_KI_DEFAULT   0.0f   // I gain — zeroed; P on integrated signal already gives steady-state velocity error rejection
 // Ignore heading errors below this threshold to avoid micro-oscillations.
-#define HEADING_HOLD_DEADBAND     0.003f  // rad ≈ 0.17°
+#define HEADING_HOLD_DEADBAND     0.010f  // rad ≈ 0.57° (widened from 0.005 to suppress limit-cycle excitation)
 // Maximum angular correction (rad/s) injected into ang_z.
 //
 // FORWARD (lin_x > 0): capped at 0.25 rad/s so the slower wheel can't go below
@@ -194,10 +194,17 @@
 // needed to bring the faster wheel down to the slower wheel's physical limit.
 // At 0.55 rad/s: the strong wheel is slowed by 33 mm/s (100→67 mm/s), which is
 // enough to match a weak motor that tops out at ~70 mm/s backward.
-#define HEADING_HOLD_MAX_CORR     0.25f  // forward limit
-#define HEADING_HOLD_MAX_CORR_REV 0.55f  // reverse limit — larger to overcome asymmetry
+#define HEADING_HOLD_MAX_CORR     0.30f  // forward limit — enough for Kp*err + iterm at typical asymmetry
+#define HEADING_HOLD_MAX_CORR_REV 0.40f  // reverse limit — increased from 0.25; reverse needs more authority (L/R ratio ~0.92)
 // Anti-windup clamp for the integral accumulator (rad·s).
-#define HEADING_HOLD_I_MAX        0.30f
+#define HEADING_HOLD_I_MAX        0.50f  // increased from 0.30 so Ki can accumulate enough to cover motor asymmetry
+
+// Derivative gain — damps oscillation by opposing rapid changes in heading error.
+// Acts on d(heading_err)/dt ≈ (v_left − v_right) / wheel_separation.
+// Filtered with a first-order low-pass at HEADING_HOLD_D_FILTER_HZ to suppress
+// encoder noise amplification.
+#define HEADING_HOLD_KD_DEFAULT   0.0f   // D gain — disabled; empirically made wobble worse (encoder noise amplification)
+#define HEADING_HOLD_D_FILTER_HZ   5.0f  // low-pass cutoff for derivative term (Hz) — lowered for when KD is re-enabled
 
 // Encoder differential trim — equalises left/right wheel distance during
 // straight-line driving.  Complements the gyro heading hold with direct
@@ -216,6 +223,15 @@
 // Default 1.5 m/s²: ramps from 0 to max (0.55 m/s) in ~0.37 s.
 // Set to 0.0 to disable (instantaneous — pre-ramp behaviour).
 #define VEL_RAMP_DEFAULT  1.5f  // m/s²
+
+// Velocity measurement low-pass filter cutoff (Hz).
+// Raw encoder velocity (one-sample difference) contains quantization noise and
+// motor cogging/gearbox ripple that the PID tries to correct, amplifying it into
+// ~2 Hz oscillation.  A first-order exponential filter smooths the measurement
+// before the PID sees it, breaking the positive-feedback loop.
+// Alpha = dt / (tau + dt), tau = 1 / (2π * cutoff).
+// At 5 Hz, 50 Hz update: alpha ≈ 0.39 → moderate smoothing, ~18° phase lag at 2 Hz.
+#define VEL_FILTER_HZ   5.0f
 
 // Dynamixel position tick: ~0.001534 rad/tick (4096 ticks/rev)
 #define TICK_TO_RAD     0.001533981f
@@ -398,7 +414,7 @@ static bool load_calibration_from_flash(void) {
 // CONTROL TABLE  (register map — must be large enough for all defined ADDR_* + their width)
 // ============================================================
 
-#define REG_SIZE 312u
+#define REG_SIZE 316u
 static uint8_t regs[REG_SIZE];
 
 // --- typed register accessors --------------------------------
@@ -479,6 +495,19 @@ static inline void w_f32(uint addr, float v) {
 #define ADDR_DIAG_CRC_FAIL      244u  // uint32 — CRC failures (silently discarded)
 #define ADDR_DIAG_VEL_WRITES    248u  // uint32 — velocity register writes detected
 #define ADDR_DIAG_READ_COUNT    252u  // uint32 — READ instructions processed
+
+// Feedforward integral seed — pre-loads heading_hold_iterm when straight-line
+// driving begins, eliminating the startup heading transient caused by motor
+// asymmetry.  Values are learned by the auto-tuner's ILC calibration phase.
+#define ADDR_HEADING_HOLD_I_SEED_FWD  256u  // float (RW) — integral seed for forward
+#define ADDR_HEADING_HOLD_I_SEED_REV  260u  // float (RW) — integral seed for reverse
+#define ADDR_HEADING_HOLD_ITERM       264u  // float (R)  — current integral accumulator
+// Velocity-level feedforward trim — directly compensates known motor asymmetry
+// at the wheel setpoint level.  Learned by the auto-tuner from measured L-R
+// velocity differences.  Applied as: v_left += trim/2, v_right -= trim/2.
+// Units: m/s (signed: positive = speed up left relative to right).
+#define ADDR_VEL_TRIM_FWD             268u  // float (RW) — velocity trim, forward
+#define ADDR_VEL_TRIM_REV             272u  // float (RW) — velocity trim, reverse
                                       // NOTE: address 170 matches turtlebot3_node control_table.hpp;
                                       //       verify if upgrading the ROS package.
 
@@ -542,6 +571,9 @@ static inline void w_f32(uint addr, float v) {
 #define ADDR_HEADING_HOLD_KI  292u  // float (read/write) — I gain for heading hold
 #define ADDR_HEADING_HOLD_CORR 296u // float (read-only)  — current ang_z correction (rad/s)
 
+// Derivative gain for heading hold — damps oscillation.
+#define ADDR_HEADING_HOLD_KD  312u  // float (read/write) — D gain for heading hold
+
 // Encoder differential trim (straight-line wheel equalisation)
 #define ADDR_ENC_TRIM_KP   300u  // float (read/write) — gain for encoder trim
 #define ADDR_DBG_ENC_TRIM  304u  // float (read-only)  — current per-wheel trim (m/s)
@@ -589,6 +621,7 @@ static void init_registers(void) {
     // Heading hold — enabled by default; corrects straight-line drift in both forward and reverse.
     w_f32(ADDR_HEADING_HOLD_KP, HEADING_HOLD_KP_DEFAULT);
     w_f32(ADDR_HEADING_HOLD_KI, HEADING_HOLD_KI_DEFAULT);
+    w_f32(ADDR_HEADING_HOLD_KD, HEADING_HOLD_KD_DEFAULT);
     w_f32(ADDR_DBG_HEADING_ERR, 0.0f);
     w_f32(ADDR_HEADING_HOLD_CORR, 0.0f);
     regs[ADDR_HEADING_HOLD_EN] = 1u;  // enabled
@@ -597,6 +630,15 @@ static void init_registers(void) {
     w_f32(ADDR_ENC_TRIM_KP, ENC_TRIM_KP_DEFAULT);
     w_f32(ADDR_DBG_ENC_TRIM, 0.0f);
     w_f32(ADDR_DBG_ENC_DIFF, 0.0f);
+
+    // Feedforward integral seed — zeroed until auto-tuner writes learned values.
+    w_f32(ADDR_HEADING_HOLD_I_SEED_FWD, 0.0f);
+    w_f32(ADDR_HEADING_HOLD_I_SEED_REV, 0.0f);
+    w_f32(ADDR_HEADING_HOLD_ITERM, 0.0f);
+
+    // Velocity-level trim — zeroed until auto-tuner writes learned values.
+    w_f32(ADDR_VEL_TRIM_FWD, 0.0f);
+    w_f32(ADDR_VEL_TRIM_REV, 0.0f);
 
     // Battery initial placeholder — updated to real GPIO reading within first 50 ms.
     // Default to "on battery, mid-charge" (14.80 V, 50 %) until first sensor tick.
@@ -2285,6 +2327,9 @@ static float   pid_output[2]     = {0.0f, 0.0f};  // [0]=left, [1]=right
 static float   pid_prev_error[2] = {0.0f, 0.0f};
 static int32_t enc_pid_prev_l    = 0;  // encoder snapshot from last PID cycle
 static int32_t enc_pid_prev_r    = 0;
+// Low-pass filtered velocity measurements (m/s).  Used for PID error computation.
+static float   filt_v_l = 0.0f;
+static float   filt_v_r = 0.0f;
 
 // Slew-rate limiter state — current ramped setpoints fed into the PID.
 static float   v_left_setpoint   = 0.0f;
@@ -2295,6 +2340,8 @@ static float   v_right_setpoint  = 0.0f;
 // error, immune to BNO055 vibration-rectification gyro bias.
 static bool    heading_hold_active = false;
 static float   heading_hold_iterm  = 0.0f;  // integral accumulator
+static float   heading_hold_prev_err = 0.0f; // previous heading error (for derivative)
+static float   heading_hold_d_filt   = 0.0f; // low-pass filtered derivative
 
 // Encoder differential trim state — accumulated (L−R) distance during straight driving.
 static float   enc_straight_diff   = 0.0f;  // metres
@@ -2337,9 +2384,16 @@ static void update_odometry(float dt) {
     if (regs[ADDR_HEADING_HOLD_EN] != 0u
         && fabsf(ang_z) < 0.01f && fabsf(lin_x) > 0.005f) {
         if (!heading_hold_active) {
-            // Start of straight-line segment — reset state
+            // Start of straight-line segment — load feedforward integral seed.
+            // The seed value is learned by the auto-tuner's ILC phase and
+            // pre-compensates for known motor asymmetry, eliminating the
+            // ±2° startup transient that occurs when iterm starts at zero.
             enc_straight_diff   = 0.0f;
-            heading_hold_iterm  = 0.0f;   // reset integrator
+            heading_hold_iterm  = (lin_x < 0.0f)
+                                ? r_f32(ADDR_HEADING_HOLD_I_SEED_REV)
+                                : r_f32(ADDR_HEADING_HOLD_I_SEED_FWD);
+            heading_hold_prev_err = 0.0f; // reset derivative
+            heading_hold_d_filt   = 0.0f;
             heading_hold_active = true;
         }
 
@@ -2350,20 +2404,37 @@ static void update_odometry(float dt) {
         float heading_err = enc_straight_diff / cfg_wheel_separation;
         w_f32(ADDR_DBG_HEADING_ERR, heading_err);
 
-        float correction = 0.0f;
+        // I term always contributes — it represents learned motor bias and must
+        // act from cycle 1 (via the feedforward seed) even when heading_err is
+        // inside the deadband.  P, D, and I-accumulation are gated by the
+        // deadband so that small encoder noise doesn't drive the controller.
+        float correction = heading_hold_iterm;
+
         if (fabsf(heading_err) > HEADING_HOLD_DEADBAND) {
             float heading_kp = r_f32(ADDR_HEADING_HOLD_KP);
             float heading_ki = r_f32(ADDR_HEADING_HOLD_KI);
+            float heading_kd = r_f32(ADDR_HEADING_HOLD_KD);
 
             // P term
-            correction = heading_kp * heading_err;
+            correction += heading_kp * heading_err;
 
             // I term — accumulates persistent bias from asymmetric motors
             heading_hold_iterm += heading_ki * heading_err * safe_dt;
             // Anti-windup clamp
             if (heading_hold_iterm >  HEADING_HOLD_I_MAX) heading_hold_iterm =  HEADING_HOLD_I_MAX;
             if (heading_hold_iterm < -HEADING_HOLD_I_MAX) heading_hold_iterm = -HEADING_HOLD_I_MAX;
-            correction += heading_hold_iterm;
+
+            // D term — damps oscillation by opposing rapid heading error changes.
+            // Low-pass filter on the derivative to suppress encoder quantization noise.
+            if (heading_kd > 0.001f) {
+                float raw_d = (heading_err - heading_hold_prev_err) / safe_dt;
+                // First-order low-pass: alpha = dt / (tau + dt), tau = 1/(2π·f_cutoff)
+                float tau   = 1.0f / (2.0f * 3.14159265f * HEADING_HOLD_D_FILTER_HZ);
+                float alpha  = safe_dt / (tau + safe_dt);
+                heading_hold_d_filt = heading_hold_d_filt + alpha * (raw_d - heading_hold_d_filt);
+                correction += heading_kd * heading_hold_d_filt;
+            }
+            heading_hold_prev_err = heading_err;
 
             // Output clamp — direction-aware limit.
             // In reverse the correction slows the STRONG motor to match the weak one,
@@ -2397,27 +2468,43 @@ static void update_odometry(float dt) {
             //
             // The kinematics work out symmetrically — no sign flip required.
             ang_z += correction;
+        } else {
+            // Inside deadband: only iterm contributes (no P/D).
+            // Apply output clamp to iterm-only correction too.
+            float max_corr = (lin_x < -0.005f) ? HEADING_HOLD_MAX_CORR_REV
+                                                : HEADING_HOLD_MAX_CORR;
+            if (correction >  max_corr) correction =  max_corr;
+            if (correction < -max_corr) correction = -max_corr;
+            // Still apply to ang_z so feedforward seed acts immediately.
+            ang_z += correction;
         }
+        w_f32(ADDR_HEADING_HOLD_ITERM, heading_hold_iterm);
         w_f32(ADDR_HEADING_HOLD_CORR, correction);
     } else {
         heading_hold_active = false;
         heading_hold_iterm  = 0.0f;   // reset integrator when not straight
+        heading_hold_prev_err = 0.0f; // reset derivative state
+        heading_hold_d_filt   = 0.0f;
         enc_straight_diff   = 0.0f;   // reset differential on direction change
         w_f32(ADDR_DBG_HEADING_ERR, 0.0f);
         w_f32(ADDR_HEADING_HOLD_CORR, 0.0f);
+        w_f32(ADDR_HEADING_HOLD_ITERM, 0.0f);
     }
 
     // Differential-drive: target wheel speeds in m/s.
     float v_left  = lin_x - ang_z * (cfg_wheel_separation / 2.0f);
     float v_right = lin_x + ang_z * (cfg_wheel_separation / 2.0f);
 
-    // ── Encoder differential trim ───────────────────────────────────────────
-    // The heading hold already uses enc_straight_diff to compute its
-    // correction via ang_z.  This additional velocity-level trim provides
-    // faster response for small wheel-distance imbalances that the heading
-    // hold PI has not yet integrated out.
+    // ── Velocity-level feedforward trim ───────────────────────────────────
+    // Directly compensates known motor asymmetry learned by the auto-tuner.
+    // Acts immediately (no error integration needed), eliminating the startup
+    // heading transient caused by L-R velocity difference.
     if (heading_hold_active) {
-        w_f32(ADDR_DBG_ENC_TRIM, 0.0f);
+        float vel_trim = (lin_x < -0.005f) ? r_f32(ADDR_VEL_TRIM_REV)
+                                            : r_f32(ADDR_VEL_TRIM_FWD);
+        v_left  += vel_trim * 0.5f;
+        v_right -= vel_trim * 0.5f;
+        w_f32(ADDR_DBG_ENC_TRIM, vel_trim);
         w_f32(ADDR_DBG_ENC_DIFF, enc_straight_diff);
     } else {
         enc_straight_diff = 0.0f;
@@ -2475,8 +2562,18 @@ static void update_odometry(float dt) {
     // Measured wheel velocities (m/s) from encoder.
     float meas_v_l = signed_dl * ENC_RAD_PER_COUNT * cfg_wheel_radius / safe_dt;
     float meas_v_r = signed_dr * ENC_RAD_PER_COUNT * cfg_wheel_radius / safe_dt;
-    w_f32(ADDR_DBG_VEL_L, meas_v_l);
-    w_f32(ADDR_DBG_VEL_R, meas_v_r);
+
+    // Low-pass filter on measured velocity to suppress encoder quantization noise
+    // and motor cogging ripple before the PID uses it.
+    {
+        float tau_v   = 1.0f / (2.0f * 3.14159265f * VEL_FILTER_HZ);
+        float alpha_v = safe_dt / (tau_v + safe_dt);
+        filt_v_l = filt_v_l + alpha_v * (meas_v_l - filt_v_l);
+        filt_v_r = filt_v_r + alpha_v * (meas_v_r - filt_v_r);
+    }
+    // Write filtered velocities to debug registers (what PID actually sees).
+    w_f32(ADDR_DBG_VEL_L, filt_v_l);
+    w_f32(ADDR_DBG_VEL_R, filt_v_r);
 
     // Accumulate encoder differential during straight-line driving.
     if (heading_hold_active) {
@@ -2493,13 +2590,14 @@ static void update_odometry(float dt) {
     float kp = r_f32(ADDR_PID_KP);
     float ki = r_f32(ADDR_PID_KI);
 
-    float err_l = v_left  - meas_v_l;
-    float err_r = v_right - meas_v_r;
+    float err_l = v_left  - filt_v_l;   // use filtered velocity for PID
+    float err_r = v_right - filt_v_r;
 
     if (fabsf(v_left) < 0.001f || !torque_on) {
         // Target zero (or torque off): reset controller cleanly.
         pid_output[0]     = 0.0f;
         pid_prev_error[0] = 0.0f;
+        filt_v_l           = 0.0f;  // reset velocity filter
     } else {
         // Direction-change reset: if commanded direction opposes accumulated output,
         // reset immediately so the motor reverses without a 5+ second drain.
@@ -2526,6 +2624,7 @@ static void update_odometry(float dt) {
     if (fabsf(v_right) < 0.001f || !torque_on) {
         pid_output[1]     = 0.0f;
         pid_prev_error[1] = 0.0f;
+        filt_v_r           = 0.0f;  // reset velocity filter
     } else {
         float cmd_sign_r = (v_right > 0.0f) ? 1.0f : -1.0f;
         float out_sign_r = (pid_output[1] > 0.001f) ? 1.0f
