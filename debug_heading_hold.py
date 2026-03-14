@@ -24,15 +24,15 @@ ADDR_CMD_LINEAR_X   = 150  # int32 — 0.01 m/s
 ADDR_CMD_ANGULAR_Z  = 170  # int32 — 0.01 rad/s
 ADDR_DBG_VEL_L      = 212  # float32
 ADDR_DBG_VEL_R      = 216  # float32
-ADDR_HEADING_HOLD_KP  = 240  # float32
-ADDR_DBG_HEADING_ERR  = 244  # float32
-ADDR_HEADING_HOLD_EN  = 248  # uint8
-ADDR_HEADING_HOLD_KI  = 252  # float32
-ADDR_HEADING_HOLD_CORR = 256  # float32
-ADDR_ENC_TRIM_KP      = 260  # float32
-ADDR_DBG_ENC_TRIM     = 264  # float32
-ADDR_DBG_ENC_DIFF     = 268  # float32
-ADDR_IMU_ANG_VEL_Z    = 56   # float32 — raw gyro Z
+ADDR_HEADING_HOLD_KP  = 280  # float32
+ADDR_DBG_HEADING_ERR  = 284  # float32
+ADDR_HEADING_HOLD_EN  = 288  # uint8
+ADDR_HEADING_HOLD_KI  = 292  # float32
+ADDR_HEADING_HOLD_CORR = 296  # float32
+ADDR_ENC_TRIM_KP      = 300  # float32
+ADDR_DBG_ENC_TRIM     = 304  # float32
+ADDR_DBG_ENC_DIFF     = 308  # float32
+ADDR_IMU_ANG_VEL_Z    = 68   # float32 — raw gyro Z
 
 # ── CRC ───────────────────────────────────────────────────────────────────────
 def _make_crc_table():

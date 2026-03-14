@@ -80,16 +80,18 @@
 #define PIN_UPS_PLD   26u     // GP26 = Grove 6, pin 1 (Yellow) — Power Loss Detect
 #define PIN_UPS_LBAT  27u     // GP27 = Grove 6, pin 2 (White)  — Low Battery
 
-// DFRobot FIT0450 TT Motor with Encoder (120:1, 8 PPR motor shaft) — quadrature.
+// JGA25-371 DC Gearmotor with Hall-Effect Encoder (30:1, 12V/200RPM, 11 PPR motor shaft).
+// Running at ~5 V from Robo Pico motor driver output (reduced speed ~83 RPM).
+// Hall encoder: magnetic disc with 2 hall-effect sensors → 11 PPR on motor shaft.
 // Signals pass through a TXS0108E 8-ch bidirectional level shifter (3.3 V ↔ 5 V).
-// Grove connector pin 1 (Yellow) → FIT0450 Blue  wire = ENC_A (channel A)
-// Grove connector pin 2 (White)  → FIT0450 Green wire = ENC_B (channel B)
-// Encoder VCC = 5 V (via level-shifter HV rail), GND = Black.
 // Pull-ups enabled on 3.3 V side (Pico GPIO internal pull-ups are sufficient post-shifter).
 #define PIN_ENC_L_A   16u     // GP16 = Grove 4, pin 1 (Yellow/Blue)  — Left  encoder channel A
 #define PIN_ENC_L_B   17u     // GP17 = Grove 4, pin 2 (White/Green) — Left  encoder channel B
-#define PIN_ENC_R_A   4u      // GP4 = Grove 3, pin 1 (Yellow/Blue)  — Right encoder channel A
-#define PIN_ENC_R_B   5u      // GP5 = Grove 3, pin 2 (White/Green) — Right encoder channel B
+#define PIN_ENC_R_A   4u      // GP4 = Grove 3, pin 1 — Right encoder channel A
+#define PIN_ENC_R_B   5u      // GP5 = Grove 3, pin 2 — Right encoder channel B
+// NOTE: Right encoder counts are negated in the PIO ISR to match forward-positive
+// convention for the JGA25-371 motor (hall-effect encoder produces opposite polarity
+// from the old FIT0450). See pio_encoder_isr().
 
 // Pico 2 system clock — use the SDK-defined SYS_CLK_HZ (150 MHz for RP2350).
 // Do not redefine; it comes from hardware/platform_defs.h.
@@ -105,8 +107,9 @@
 // Adjust these defines when swapping motors, wheels, or chassis.
 //
 // Current setup:
-//   Motor : Cytron TT DC Dual Metal Gearbox Motor (1:90 gear ratio, 3–6 V DC)
-//           https://www.cytron.io/p-tt-motor-dual-metal-shaft
+//   Motor : JGA25-371 DC Gearmotor (30:1 gear ratio, 12 V / 200 RPM)
+//           Running at ~5 V from Robo Pico → ~83 RPM actual
+//   Encoder: Hall-effect, 11 PPR motor shaft, X4 quadrature → 1320 counts/wheel-rev
 //   Wheel : Cytron Small Robot Rubber Wheel 65×26.5 mm (68.1 mm OD with tyre)
 //           https://www.cytron.io/p-small-robot-rubber-wheel-65x26.5mm
 //   Chassis: Custom, 13.5 cm wheel-to-wheel separation
@@ -117,22 +120,20 @@
 //   turtlebot3_bringup/param/humble/burger.yaml
 // ============================================================
 
-#define WHEEL_RADIUS_DEFAULT        0.031826f  // calibrated 2026-03-09
+#define WHEEL_RADIUS_DEFAULT        0.034050f  // nominal — recalibrate with calibrate_distance.py
 // ANGULAR CALIBRATION: do NOT use a scale factor (it breaks odometry).
 // Tune WHEEL_SEPARATION to match effective turning base; run auto_calibrate_imu_turn.py.
-#define WHEEL_SEPARATION_DEFAULT    0.121642f  // metres — effective turning base; calibrated by auto_calibrate_imu_turn.py
-#define MAX_WHEEL_SPEED_MS_DEFAULT  0.550000f  // m/s — FIT0450 @6V no-load ≈160RPM×π×0.065
+#define WHEEL_SEPARATION_DEFAULT    0.121642f  // metres — effective turning base; recalibrate after motor swap
+#define MAX_WHEEL_SPEED_MS_DEFAULT  0.074081f  // calibrated 2026-03-13: USS ground truth, correction=0.9203 (-8.0%)
 #define LEFT_MOTOR_REVERSED_DEFAULT  1       // CHAN_B = physical forward for left motor (M2)
 #define RIGHT_MOTOR_REVERSED_DEFAULT 0       // CHAN_A = physical forward for right motor (M1)
 #define SWAP_LEFT_RIGHT_MOTORS_DEFAULT 1      // motors physically swapped: M1→right, M2→left
 
 // Minimum duty cycle (dead-zone compensation).
-// DFRobot FIT0450 TT Motor with Encoder (6V 160RPM 120:1) — higher gear
-// ratio means more torque at lower speed; per-motor values compensate for
-// manufacturing differences between left and right motors.
+// JGA25-371 12V motor at ~5V supply — needs higher minimum duty to overcome
+// friction at reduced voltage.  Re-run calibrate_deadzone.py to fine-tune.
 // Any non-zero throttle is boosted to at least this value.
 // Set to 0.0f to disable.  Range: 0.0 – 1.0.
-// Re-run calibrate_deadzone.py if motors stall or overshoot.
 #define MOTOR_MIN_DUTY_LEFT_DEFAULT   0.15f  // calibrated — calibrate_deadzone.py
 #define MOTOR_MIN_DUTY_RIGHT_DEFAULT  0.15f  // calibrated — calibrate_deadzone.py
 
@@ -154,12 +155,14 @@
 // ============================================================
 // ENCODER-BASED VELOCITY PID
 // ============================================================
-// DFRobot FIT0450 encoder: 8 PPR motor shaft, X4 quadrature decoding, 120:1 gearbox.
-// Total counts per wheel revolution: 8 × 4 × 120 = 3840.
-#define ENC_PPR_MOTOR           8u      // pulses per motor shaft revolution
-#define ENC_GEAR_RATIO          120u    // gearbox reduction ratio
+// JGA25-371 hall-effect encoder: 11 PPR motor shaft, X4 quadrature decoding, 44:1 gearbox.
+// Total counts per wheel revolution: 11 × 4 × 44 = 1936.
+// Verified by hand-rotation test: L=1963, R=1900 (avg 1932 ≈ 1936 within hand error).
+// The "12V 200RPM" variant is actually 44:1 (motor ~8600 RPM / 44 ≈ 195 RPM).
+#define ENC_PPR_MOTOR           11u     // hall-effect pulses per motor shaft revolution
+#define ENC_GEAR_RATIO          44u     // gearbox reduction ratio (verified by hand-rotation test)
 // Counts per full wheel revolution (X4 quadrature)
-#define ENC_COUNTS_PER_WHEEL_REV  ((float)(ENC_PPR_MOTOR * 4u * ENC_GEAR_RATIO))  // 3840.0
+#define ENC_COUNTS_PER_WHEEL_REV  ((float)(ENC_PPR_MOTOR * 4u * ENC_GEAR_RATIO))  // 1936.0
 // Radians of wheel rotation per raw encoder count
 #define ENC_RAD_PER_COUNT  (2.0f * 3.14159265358979f / ENC_COUNTS_PER_WHEEL_REV)
 
@@ -199,6 +202,26 @@
 // Anti-windup clamp for the integral accumulator (rad·s).
 #define HEADING_HOLD_I_MAX        0.50f  // increased from 0.30 so Ki can accumulate enough to cover motor asymmetry
 
+// IMU-encoder complementary filter for heading hold.
+// Fuses gyroscope angular velocity (short-term accurate, drifts) with
+// encoder differential (long-term stable, noisy/slip-prone) using a first-
+// order complementary filter:
+//   heading_fused = α·(heading_fused_prev + ω_gyro·dt) + (1−α)·heading_encoder
+// High-pass on gyro rejects drift; low-pass on encoder rejects noise/slip.
+// α=0 → pure encoder (legacy behaviour).  α=1 → pure gyro (drifts).
+// At α=0.50, 50 Hz: crossover ~8 Hz  →  encoder dominates even short-term,
+// gyro smooths inter-sample noise only.  With BNO055 vibration-rectification
+// bias of 3–6 °/s, lower α is essential to keep the biased gyro from dominating.
+// Raise toward 0.8–0.9 only with a clean gyro (e.g. BNO085 with vibration isolation).
+#define IMU_HEADING_COMP_ALPHA_DEFAULT  0.30f  // complementary filter weight (0=encoder only, 1=gyro only)
+// Online gyro bias estimator — learns the vibration-rectification DC offset
+// that BNO055 MEMS gyros exhibit under motor vibration (~3-6 °/s).
+// β controls how fast the bias tracks.  At 50 Hz, β=0.02 gives a time
+// constant of ~1 s — fast enough to catch motor-on transients, slow enough
+// to ignore cycle-to-cycle noise.  The bias is subtracted from the raw
+// gyro reading before integration.
+#define IMU_HEADING_BIAS_BETA_DEFAULT   0.02f  // bias estimator learning rate
+
 // Derivative gain — damps oscillation by opposing rapid changes in heading error.
 // Acts on d(heading_err)/dt ≈ (v_left − v_right) / wheel_separation.
 // Filtered with a first-order low-pass at HEADING_HOLD_D_FILTER_HZ to suppress
@@ -215,6 +238,21 @@
 // Maximum per-wheel velocity trim the encoder correction can inject (m/s).
 #define ENC_TRIM_MAX_CORR         0.05f
 
+
+// Velocity-level feedforward trim defaults — compensates known motor
+// asymmetry that causes left/right drift during straight-line driving.
+// Learned by calibrate_drift.py, applied as:
+//   v_left  += trim / 2
+//   v_right -= trim / 2
+// Positive = correct left drift (speed up left, slow right).
+#define VEL_TRIM_FWD_DEFAULT          0.014279f  // calibrated 2026-03-13: drift_calib, 3 iterations
+#define VEL_TRIM_REV_DEFAULT         -0.002300f  // calibrated 2026-03-13: diagnose_reverse.py auto-tune
+// Preload the heading-hold integrator with the equivalent angular correction
+// implied by the learned velocity trim. This removes the multi-degree startup
+// transient that otherwise occurs while the P controller waits for encoder
+// heading error to build up enough to generate the same correction.
+#define HEADING_HOLD_I_SEED_FWD_DEFAULT   0.117385f  // angular-equivalent of forward trim
+#define HEADING_HOLD_I_SEED_REV_DEFAULT   0.007800f  // calibrated 2026-03-13: diagnose_reverse.py auto-tune
 // Velocity slew-rate (ramp) limiter — applied to the PID setpoint each 50 Hz cycle.
 // Limits the rate of change of the commanded wheel velocity to prevent wheel slip
 // and match TurtleBot3 OpenCR trapezoidal velocity profile behaviour.
@@ -263,7 +301,7 @@ static inline float rpm_per_ms(void) {
 }
 
 #define CALIB_FLASH_MAGIC   0x43414C31u  // "CAL1"
-#define CALIB_FLASH_VERSION 11u // bumped: left_motor_reversed 1→0, encoder sign fixes
+#define CALIB_FLASH_VERSION 12u // bumped: invalidate pre-drift-fix blobs that restore stale motion calibration at boot
 #define CALIB_FLASH_OFFSET  (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
 
 typedef struct {
@@ -414,7 +452,7 @@ static bool load_calibration_from_flash(void) {
 // CONTROL TABLE  (register map — must be large enough for all defined ADDR_* + their width)
 // ============================================================
 
-#define REG_SIZE 316u
+#define REG_SIZE 360u
 static uint8_t regs[REG_SIZE];
 
 // --- typed register accessors --------------------------------
@@ -574,6 +612,23 @@ static inline void w_f32(uint addr, float v) {
 // Derivative gain for heading hold — damps oscillation.
 #define ADDR_HEADING_HOLD_KD  312u  // float (read/write) — D gain for heading hold
 
+// IMU-encoder complementary filter heading fusion.
+// When a BNO085 is present and enabled, the heading error used by the
+// heading-hold PID is computed via a complementary filter that fuses gyro
+// angular velocity with encoder differential heading.
+// BNO055 is intentionally excluded from heading fusion because its gyro shows
+// a large vibration-rectification bias under motor load, which causes long-run
+// forward drift. In that case the controller falls back to encoder-only hold.
+// This gives sub-second responsiveness from a clean gyro (immune to wheel
+// slip) and long-term accuracy from the encoders (immune to gyro drift).
+#define ADDR_IMU_HEADING_ALPHA  316u  // float (RW) — complementary filter weight (0=enc, 1=gyro)
+#define ADDR_IMU_HEADING_EN     320u  // uint8 (RW) — 1=enable IMU fusion (default), 0=disable
+#define ADDR_DBG_HEADING_FUSED  324u  // float (R)  — fused heading error (rad)
+#define ADDR_DBG_HEADING_GYRO   328u  // float (R)  — gyro-only integrated heading (rad)
+#define ADDR_DBG_HEADING_ENC    332u  // float (R)  — encoder-only heading error (rad)
+#define ADDR_IMU_HEADING_BIAS_BETA 336u // float (RW) — gyro bias estimator learning rate
+#define ADDR_DBG_GYRO_BIAS     340u  // float (R)  — estimated gyro-Z bias (rad/s)
+
 // Encoder differential trim (straight-line wheel equalisation)
 #define ADDR_ENC_TRIM_KP   300u  // float (read/write) — gain for encoder trim
 #define ADDR_DBG_ENC_TRIM  304u  // float (read-only)  — current per-wheel trim (m/s)
@@ -631,14 +686,29 @@ static void init_registers(void) {
     w_f32(ADDR_DBG_ENC_TRIM, 0.0f);
     w_f32(ADDR_DBG_ENC_DIFF, 0.0f);
 
-    // Feedforward integral seed — zeroed until auto-tuner writes learned values.
-    w_f32(ADDR_HEADING_HOLD_I_SEED_FWD, 0.0f);
-    w_f32(ADDR_HEADING_HOLD_I_SEED_REV, 0.0f);
+    // Feedforward integral seed — preload with the angular-equivalent of the
+    // learned velocity trim so straight-line correction is available from the
+    // first control cycle. The auto-tuner may still override these at runtime.
+    w_f32(ADDR_HEADING_HOLD_I_SEED_FWD, HEADING_HOLD_I_SEED_FWD_DEFAULT);
+    w_f32(ADDR_HEADING_HOLD_I_SEED_REV, HEADING_HOLD_I_SEED_REV_DEFAULT);
     w_f32(ADDR_HEADING_HOLD_ITERM, 0.0f);
 
-    // Velocity-level trim — zeroed until auto-tuner writes learned values.
-    w_f32(ADDR_VEL_TRIM_FWD, 0.0f);
-    w_f32(ADDR_VEL_TRIM_REV, 0.0f);
+    // Velocity-level feedforward trim — compensates motor asymmetry causing drift.
+    // Learned by calibrate_drift.py; auto-tuner may override at runtime.
+    w_f32(ADDR_VEL_TRIM_FWD, VEL_TRIM_FWD_DEFAULT);
+    w_f32(ADDR_VEL_TRIM_REV, VEL_TRIM_REV_DEFAULT);
+
+    // IMU-encoder complementary filter — enabled by default; weight α=0.98.
+    // When no hardware IMU is present, fusion is auto-disabled regardless of this flag.
+    w_f32(ADDR_IMU_HEADING_ALPHA, IMU_HEADING_COMP_ALPHA_DEFAULT);
+    regs[ADDR_IMU_HEADING_EN] = 1u;  // enabled by default
+    w_f32(ADDR_DBG_HEADING_FUSED, 0.0f);
+    w_f32(ADDR_DBG_HEADING_GYRO, 0.0f);
+    w_f32(ADDR_DBG_HEADING_ENC, 0.0f);
+
+    // IMU gyro bias estimator — zero initial bias; converges online.
+    w_f32(ADDR_IMU_HEADING_BIAS_BETA, IMU_HEADING_BIAS_BETA_DEFAULT);
+    w_f32(ADDR_DBG_GYRO_BIAS, 0.0f);
 
     // Battery initial placeholder — updated to real GPIO reading within first 50 ms.
     // Default to "on battery, mid-charge" (14.80 V, 50 %) until first sensor tick.
@@ -1532,10 +1602,10 @@ static void __isr pio_encoder_isr(void) {
         enc_count_left += (int32_t)enc_quad_table[w & 0x0Fu];
         enc_irq_dbg++;
     }
-    // Right encoder (SM1)
+    // Right encoder (SM1) — negated for JGA25-371 forward-positive convention
     while (!pio_sm_is_rx_fifo_empty(enc_pio, ENC_SM_RIGHT)) {
         uint32_t w = pio_sm_get(enc_pio, ENC_SM_RIGHT);
-        enc_count_right += (int32_t)enc_quad_table[w & 0x0Fu];
+        enc_count_right -= (int32_t)enc_quad_table[w & 0x0Fu];
         enc_irq_dbg++;
     }
 }
@@ -2346,6 +2416,11 @@ static float   heading_hold_d_filt   = 0.0f; // low-pass filtered derivative
 // Encoder differential trim state — accumulated (L−R) distance during straight driving.
 static float   enc_straight_diff   = 0.0f;  // metres
 
+// IMU-encoder complementary filter state — heading fusion during straight-line driving.
+static float   heading_fused       = 0.0f;  // complementary filter output (rad)
+static float   heading_gyro_accum  = 0.0f;  // integrated gyro yaw for debug (rad)
+static float   gyro_bias_est       = 0.0f;  // online gyro-Z bias estimate (rad/s)
+
 static void update_odometry(float dt) {
     bool torque_on = (regs[ADDR_MOTOR_TORQUE_EN] != 0);
 
@@ -2394,15 +2469,85 @@ static void update_odometry(float dt) {
                                 : r_f32(ADDR_HEADING_HOLD_I_SEED_FWD);
             heading_hold_prev_err = 0.0f; // reset derivative
             heading_hold_d_filt   = 0.0f;
+            heading_fused       = 0.0f;   // reset complementary filter state
+            heading_gyro_accum  = 0.0f;   // reset gyro accumulator
+            gyro_bias_est       = 0.0f;   // reset bias — it flips sign with direction
             heading_hold_active = true;
         }
 
-        // Heading error from encoder differential.
-        // Forward: positive enc_straight_diff → left wheel longer → robot drifted CW → error > 0.
-        // Reverse: both deltas are negative; left more negative → enc_straight_diff < 0 → error < 0.
-        // In both cases ang_z += correction has the correct sign (see comment below).
-        float heading_err = enc_straight_diff / cfg_wheel_separation;
+        // ── Heading error — encoder-only or IMU-encoder complementary filter ──
+        //
+        // Encoder heading (accumulated L−R distance / wheel_separation):
+        //   Forward: positive enc_straight_diff → left longer → drifted CW → error > 0.
+        //   Reverse: left more negative → enc_diff < 0 → error < 0.
+        //   Sign is correct for both directions (see kinematics proof below).
+        //
+        // When a hardware IMU is present and fusion is enabled, the heading
+        // error is computed via a first-order complementary filter:
+        //   heading_fused = α·(heading_fused + ω_gyro·dt) + (1−α)·heading_enc
+        // High-pass on gyro: captures fast dynamics (bumps, wheel slip),
+        //   immune to encoder quantization noise.
+        // Low-pass on encoder: provides drift-free ground truth,
+        //   immune to gyro bias accumulation.
+        // When no IMU is present, falls back to pure encoder (legacy behaviour).
+
+        float heading_enc = enc_straight_diff / cfg_wheel_separation;
+
+        // Read IMU gyro Z angular velocity (rad/s) — updated by sensor loop.
+        float gyro_z = r_f32(ADDR_IMU_ANG_VEL_Z);
+        heading_gyro_accum += gyro_z * safe_dt;  // integrate for debug display
+
+        // Determine if IMU fusion is active.
+        // Only BNO085 participates in heading fusion. BNO055 gyro bias under
+        // motor vibration is large enough to dominate long straight runs.
+        bool imu_fuse = bno085_present && (regs[ADDR_IMU_HEADING_EN] != 0u);
+        float alpha = imu_fuse ? r_f32(ADDR_IMU_HEADING_ALPHA) : 0.0f;
+
+        float heading_err;
+        if (alpha > 0.001f) {
+            // Bias-compensated complementary filter:
+            //   1. Subtract estimated bias from raw gyro before integration.
+            //   2. Predict heading from bias-corrected gyro (high-freq).
+            //   3. Fuse prediction with encoder heading (low-freq).
+            //   4. Update bias estimate from encoder-prediction discrepancy.
+            //
+            // The encoder is drift-free long-term and acts as the reference
+            // that teaches the filter what the gyro's DC offset is.  Under
+            // motor vibration the BNO055 gyro typically shows +3 to −6 °/s
+            // of rectification bias; this estimator converges within ~1 s.
+            float beta = r_f32(ADDR_IMU_HEADING_BIAS_BETA);
+            float gyro_corrected = gyro_z - gyro_bias_est;
+            float predicted = heading_fused + gyro_corrected * safe_dt;
+
+            // Innovation: how far encoder disagrees with gyro prediction.
+            float innovation = heading_enc - predicted;
+
+            // Fuse: α-weighted blend of gyro prediction and encoder.
+            heading_fused = predicted + (1.0f - alpha) * innovation;
+            // Equivalent to: α·predicted + (1−α)·heading_enc
+
+            // Update bias estimate.  If the gyro reads too high (positive
+            // bias), predicted overshoots → innovation < 0 → bias increases
+            // (we subtract more next cycle).  Sign: Δb = −β·innovation.
+            gyro_bias_est -= beta * innovation;
+
+            // Clamp bias to a sane range (±0.25 rad/s ≈ ±14 °/s).
+            if (gyro_bias_est >  0.25f) gyro_bias_est =  0.25f;
+            if (gyro_bias_est < -0.25f) gyro_bias_est = -0.25f;
+
+            heading_err = heading_fused;
+        } else {
+            // Pure encoder fallback (no IMU or fusion disabled).
+            heading_err = heading_enc;
+            heading_fused = heading_enc;  // keep in sync for seamless re-enable
+        }
+
+        // Write debug registers.
         w_f32(ADDR_DBG_HEADING_ERR, heading_err);
+        w_f32(ADDR_DBG_HEADING_FUSED, heading_err);
+        w_f32(ADDR_DBG_HEADING_GYRO, heading_gyro_accum);
+        w_f32(ADDR_DBG_HEADING_ENC, heading_enc);
+        w_f32(ADDR_DBG_GYRO_BIAS, gyro_bias_est);
 
         // I term always contributes — it represents learned motor bias and must
         // act from cycle 1 (via the feedforward seed) even when heading_err is
@@ -2486,9 +2631,16 @@ static void update_odometry(float dt) {
         heading_hold_prev_err = 0.0f; // reset derivative state
         heading_hold_d_filt   = 0.0f;
         enc_straight_diff   = 0.0f;   // reset differential on direction change
+        heading_fused       = 0.0f;   // reset complementary filter state
+        heading_gyro_accum  = 0.0f;   // reset gyro accumulator
+        // NOTE: gyro_bias_est is NOT reset — bias persists across segments.
         w_f32(ADDR_DBG_HEADING_ERR, 0.0f);
         w_f32(ADDR_HEADING_HOLD_CORR, 0.0f);
         w_f32(ADDR_HEADING_HOLD_ITERM, 0.0f);
+        w_f32(ADDR_DBG_HEADING_FUSED, 0.0f);
+        w_f32(ADDR_DBG_HEADING_GYRO, 0.0f);
+        w_f32(ADDR_DBG_HEADING_ENC, 0.0f);
+        w_f32(ADDR_DBG_GYRO_BIAS, gyro_bias_est);  // still report current bias
     }
 
     // Differential-drive: target wheel speeds in m/s.
