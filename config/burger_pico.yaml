@@ -41,7 +41,7 @@ turtlebot3_node:
       protocol_version: 2.0
 
     wheels:
-      separation: 0.121642      # metres — calibrated effective turning base
+      separation: 0.047940      # metres — calibrated effective turning base
       radius: 0.03405           # metres — calibrated wheel radius; keep in sync with firmware/main.c
 
     motors:

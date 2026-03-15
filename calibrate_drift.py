@@ -27,6 +27,11 @@ Workflow
 Additionally, this script also writes VEL_TRIM_FWD to the firmware register
 at runtime via Dynamixel, so the correction takes effect immediately.
 
+Drift measurement modes
+-----------------------
+- `uss` (default): uses left/right ultrasonic differential to estimate heading drift
+- `imu`: uses IMU yaw change to estimate heading drift and encoder distance for travel
+
 Usage
 -----
   python3 calibrate_drift.py                   # detect drift (dry-run)
@@ -34,6 +39,12 @@ Usage
   python3 calibrate_drift.py --apply --flash   # detect + write + rebuild + flash
   python3 calibrate_drift.py --passes 5        # more passes for better accuracy
   python3 calibrate_drift.py --verify-only     # one pass, just report
+    python3 calibrate_drift.py --drift-source imu  # use IMU yaw + encoders, no USS drift measurement
+
+By default the script attempts to start required system services before waiting
+for topics:
+- `turtlebot3-bringup.service`
+- `pi-ultrasonic-dual.service` (USS mode only)
 """
 
 import argparse
@@ -54,7 +65,7 @@ from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy,
 )
-from sensor_msgs.msg import JointState, LaserScan, Range
+from sensor_msgs.msg import Imu, JointState, LaserScan, Range
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 
@@ -130,6 +141,9 @@ YLW = "\033[1;33m"
 CYN = "\033[0;36m"
 BLD = "\033[1m"
 NC  = "\033[0m"
+
+FORWARD_WINDOW_DEG = 8.0
+SERVICE_START_SETTLE_S = 6.0
 
 
 # ── firmware source helpers ───────────────────────────────────────────────────
@@ -257,6 +271,72 @@ def dxl_read_float(addr: int, port: str = DXL_PORT) -> Optional[float]:
     return None
 
 
+def ensure_required_services(drift_source: str,
+                             auto_start: bool = True) -> bool:
+    services = ["turtlebot3-bringup.service"]
+    if drift_source == "uss":
+        services.append("pi-ultrasonic-dual.service")
+
+    inactive: list[str] = []
+    for service in services:
+        result = subprocess.run(
+            ["systemctl", "is-active", "--quiet", service],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            inactive.append(service)
+
+    if not inactive:
+        print(f"  {GRN}Required services already active.{NC}")
+        return True
+
+    print(f"  {YLW}Inactive services detected:{NC} {', '.join(inactive)}")
+    if not auto_start:
+        print(f"  {YLW}Auto-start disabled. Start required services and retry.{NC}")
+        return False
+
+    print(f"  Starting required services …")
+    result = subprocess.run(["sudo", "systemctl", "start", *inactive])
+    if result.returncode != 0:
+        print(f"  {RED}Failed to start required services.{NC}")
+        return False
+
+    print(f"  Waiting {SERVICE_START_SETTLE_S:.0f}s for services to settle …")
+    time.sleep(SERVICE_START_SETTLE_S)
+
+    still_inactive: list[str] = []
+    for service in inactive:
+        result = subprocess.run(
+            ["systemctl", "is-active", "--quiet", service],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            still_inactive.append(service)
+
+    if still_inactive:
+        print(f"  {RED}Services failed to become active:{NC} {', '.join(still_inactive)}")
+        return False
+
+    print(f"  {GRN}Required services started.{NC}")
+    return True
+
+
+def restart_required_services(drift_source: str) -> bool:
+    services = ["turtlebot3-bringup.service"]
+    if drift_source == "uss":
+        services.append("pi-ultrasonic-dual.service")
+
+    print(f"  Restarting required services …")
+    result = subprocess.run(["sudo", "systemctl", "restart", *services])
+    if result.returncode != 0:
+        print(f"  {RED}Failed to restart required services.{NC}")
+        return False
+
+    print(f"  Waiting {SERVICE_START_SETTLE_S:.0f}s for services to settle …")
+    time.sleep(SERVICE_START_SETTLE_S)
+    return True
+
+
 # ── LiDAR wall bearing ───────────────────────────────────────────────────────
 
 def find_wall_bearing(scan: LaserScan,
@@ -282,12 +362,27 @@ def find_wall_bearing(scan: LaserScan,
     return best_ang
 
 
+def angle_diff(a: float, b: float) -> float:
+    delta = a - b
+    while delta > math.pi:
+        delta -= 2.0 * math.pi
+    while delta < -math.pi:
+        delta += 2.0 * math.pi
+    return delta
+
+
+def quat_to_yaw(q) -> float:
+    siny = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny, cosy)
+
+
 # ── ROS node ──────────────────────────────────────────────────────────────────
 
 class DriftCalibNode(Node):
     """
     Subscribes:  /scan, /ultrasonic/left, /ultrasonic/right,
-                 /joint_states, /odom
+                 /joint_states, /odom, /imu
     Publishes:   /cmd_vel
     """
 
@@ -324,6 +419,12 @@ class DriftCalibNode(Node):
         self._odom_yaw = 0.0
         self.create_subscription(Odometry, "/odom",
                                  self._odom_cb, BEST_EFFORT_QOS)
+
+        # IMU
+        self._imu_ok = False
+        self._imu_yaw = 0.0
+        self.create_subscription(Imu, "/imu",
+                     self._imu_cb, BEST_EFFORT_QOS)
 
     # ── callbacks ─────────────────────────────────────────────────────────
 
@@ -362,11 +463,11 @@ class DriftCalibNode(Node):
         self._odom_ok = True
         self._odom_x = msg.pose.pose.position.x
         self._odom_y = msg.pose.pose.position.y
-        q = msg.pose.pose.orientation
-        # Yaw from quaternion
-        siny = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self._odom_yaw = math.atan2(siny, cosy)
+        self._odom_yaw = quat_to_yaw(msg.pose.pose.orientation)
+
+    def _imu_cb(self, msg: Imu) -> None:
+        self._imu_ok = True
+        self._imu_yaw = quat_to_yaw(msg.orientation)
 
     # ── helpers ───────────────────────────────────────────────────────────
 
@@ -391,12 +492,16 @@ class DriftCalibNode(Node):
         self.send(0.0)
         self.spin_for(settle)
 
-    def wait_topics(self, timeout: float = 8.0) -> dict[str, bool]:
+    def wait_topics(self, timeout: float = 8.0,
+                    require_uss: bool = True,
+                    require_imu: bool = False) -> dict[str, bool]:
         """Wait for essential topics. Returns dict of topic availability."""
         end = time.time() + timeout
         while time.time() < end:
             rclpy.spin_once(self, timeout_sec=0.1)
-            if self._odom_ok and all(self._us_ok.values()) and self._scan_ok and self._joint_ok:
+            uss_ready = all(self._us_ok.values()) if require_uss else True
+            imu_ready = self._imu_ok if require_imu else True
+            if self._odom_ok and uss_ready and self._scan_ok and self._joint_ok and imu_ready:
                 break
         return {
             "odom": self._odom_ok,
@@ -404,6 +509,8 @@ class DriftCalibNode(Node):
             "uss_right": self._us_ok["right"],
             "scan": self._scan_ok,
             "joints": self._joint_ok,
+            "imu": self._imu_ok,
+            "cmd_vel_subscriber": self.count_subscribers("/cmd_vel") > 0,
         }
 
     # ── encoder ───────────────────────────────────────────────────────────
@@ -451,6 +558,20 @@ class DriftCalibNode(Node):
         s = self.us_sample(n)
         vals = [v for v in s.values() if v is not None]
         return sum(vals) / len(vals) if vals else None
+
+    def front_clearance(self, half_width_deg: float = FORWARD_WINDOW_DEG) -> Optional[float]:
+        scan = self._scan
+        if scan is None or not scan.ranges:
+            return None
+        half_width = math.radians(half_width_deg)
+        valid: list[float] = []
+        for idx, radius in enumerate(scan.ranges):
+            if not math.isfinite(radius) or radius < scan.range_min or radius > scan.range_max:
+                continue
+            angle = scan.angle_min + idx * scan.angle_increment
+            if abs(angle) <= half_width:
+                valid.append(radius)
+        return min(valid) if valid else None
 
 
 # ── alignment ─────────────────────────────────────────────────────────────────
@@ -527,7 +648,8 @@ def align_fine_uss(node: DriftCalibNode,
 
 def backup_to_distance(node: DriftCalibNode, target_m: float,
                        wheel_radius: float,
-                       speed: float = 0.05) -> bool:
+                       speed: float = 0.05,
+                       clearance_source: str = "uss") -> bool:
     """Reverse until USS mean reaches target_m. Returns True on success."""
 
     # Read min-duty from firmware source to compute minimum working speed
@@ -545,7 +667,10 @@ def backup_to_distance(node: DriftCalibNode, target_m: float,
         node.send(-speed)
         rclpy.spin_once(node, timeout_sec=BACKUP_POLL_S)
 
-        d = node.us_mean(n=3)
+        if clearance_source == "imu":
+            d = node.front_clearance()
+        else:
+            d = node.us_mean(n=3)
         enc_d = node.enc_distance(wheel_radius)
 
         if d is not None and d >= target_m:
@@ -558,7 +683,7 @@ def backup_to_distance(node: DriftCalibNode, target_m: float,
     node.stop(0.5)
     node.enc_stop()
     print(f"  {YLW}Max backup reached ({BACKUP_MAX_M*100:.0f} cm){NC}")
-    d = node.us_mean(n=3)
+    d = node.front_clearance() if clearance_source == "imu" else node.us_mean(n=3)
     return d is not None and d >= target_m * 0.9
 
 
@@ -569,6 +694,7 @@ def measure_drift(node: DriftCalibNode,
                   drive_speed: float,
                   wheel_radius: float,
                   sensor_sep: float,
+                  drift_source: str,
                   pass_num: int,
                   total_passes: int) -> Optional[dict]:
     """
@@ -578,19 +704,26 @@ def measure_drift(node: DriftCalibNode,
     print(f"\n{BLD}── Pass {pass_num}/{total_passes} ──{NC}  "
           f"target = {drive_distance_m*100:.1f} cm  speed = {drive_speed:.3f} m/s")
 
-    # Sample USS before
-    print(f"  Sampling ultrasonic before …", end=" ", flush=True)
-    before = node.us_sample(n=USS_SAMPLES)
-    bl = before.get("left")
-    br = before.get("right")
-    if bl is None or br is None:
-        print(f"\n  {RED}USS sensor not responding — cannot measure drift{NC}")
-        return None
-    print(f"left={bl*100:.1f}cm  right={br*100:.1f}cm")
+    bl = br = al = ar = None
+    theta_rad = 0.0
+    direction = "STRAIGHT"
 
-    # Record odom yaw before
+    if drift_source == "uss":
+        print(f"  Sampling ultrasonic before …", end=" ", flush=True)
+        before = node.us_sample(n=USS_SAMPLES)
+        bl = before.get("left")
+        br = before.get("right")
+        if bl is None or br is None:
+            print(f"\n  {RED}USS sensor not responding — cannot measure drift{NC}")
+            return None
+        print(f"left={bl*100:.1f}cm  right={br*100:.1f}cm")
+    else:
+        print(f"  Drift source: IMU yaw + encoder distance")
+
+    # Record yaw before
     rclpy.spin_once(node, timeout_sec=0.1)
     yaw_before = node._odom_yaw
+    imu_yaw_before = node._imu_yaw
 
     # Reset encoders
     node.enc_reset()
@@ -602,10 +735,14 @@ def measure_drift(node: DriftCalibNode,
     drive_end = time.time() + drive_time
     while time.time() < drive_end:
         # Safety: check USS
-        uss_now = node._us.get("left") or node._us.get("right")
-        if uss_now is not None and uss_now < WALL_STOP_M:
+        if drift_source == "imu":
+            clearance_now = node.front_clearance()
+        else:
+            clearance_now = node._us.get("left") or node._us.get("right")
+        if clearance_now is not None and clearance_now < WALL_STOP_M:
             node.stop(0.3)
-            print(f"\n  {RED}SAFETY STOP — USS < {WALL_STOP_M*100:.0f} cm{NC}")
+            label = "LiDAR" if drift_source == "imu" else "USS"
+            print(f"\n  {RED}SAFETY STOP — {label} < {WALL_STOP_M*100:.0f} cm{NC}")
             break
         node.send(drive_speed)
         rclpy.spin_once(node, timeout_sec=0.05)
@@ -620,44 +757,48 @@ def measure_drift(node: DriftCalibNode,
     enc_r_deg = math.degrees(node._enc_delta["right"])
     print(f"  Encoder:  {enc_dist*100:.2f} cm  (ΔL={enc_l_deg:+.1f}°  ΔR={enc_r_deg:+.1f}°)")
 
-    # Odom yaw after
+    # Yaw after
     rclpy.spin_once(node, timeout_sec=0.1)
     yaw_after = node._odom_yaw
-    yaw_change = yaw_after - yaw_before
-    while yaw_change > math.pi: yaw_change -= 2 * math.pi
-    while yaw_change < -math.pi: yaw_change += 2 * math.pi
+    yaw_change = angle_diff(yaw_after, yaw_before)
+    imu_yaw_after = node._imu_yaw
+    imu_yaw_change = angle_diff(imu_yaw_after, imu_yaw_before)
 
-    # Sample USS after
-    print(f"  Sampling ultrasonic after  …", end=" ", flush=True)
-    after = node.us_sample(n=USS_SAMPLES)
-    al = after.get("left")
-    ar = after.get("right")
-    if al is None or ar is None:
-        print(f"\n  {RED}USS sensor not responding after drive{NC}")
-        return None
-    print(f"left={al*100:.1f}cm  right={ar*100:.1f}cm")
+    delta_l = delta_r = drift_diff = 0.0
+    if drift_source == "uss":
+        print(f"  Sampling ultrasonic after  …", end=" ", flush=True)
+        after = node.us_sample(n=USS_SAMPLES)
+        al = after.get("left")
+        ar = after.get("right")
+        if al is None or ar is None:
+            print(f"\n  {RED}USS sensor not responding after drive{NC}")
+            return None
+        print(f"left={al*100:.1f}cm  right={ar*100:.1f}cm")
 
-    # Compute drift
-    delta_l = bl - al  # how much closer the left sensor got to wall
-    delta_r = br - ar  # how much closer the right sensor got to wall
+        # If ΔR > ΔL → right side got more closer → robot angled left → left drift
+        delta_l = bl - al
+        delta_r = br - ar
+        drift_diff = delta_r - delta_l
+        theta_rad = math.atan2(drift_diff, sensor_sep)
 
-    # If ΔR > ΔL → right side got more closer → robot angled left → left drift
-    # Angular drift θ ≈ (ΔR - ΔL) / sensor_sep
-    drift_diff = delta_r - delta_l
-    theta_rad = math.atan2(drift_diff, sensor_sep)
+        if drift_diff > 0.005:
+            direction = "LEFT"
+        elif drift_diff < -0.005:
+            direction = "RIGHT"
 
-    # Drift direction
-    if drift_diff > 0.005:
-        direction = "LEFT"
-    elif drift_diff < -0.005:
-        direction = "RIGHT"
+        print(f"\n  USS ΔL = {delta_l*100:+.2f} cm    ΔR = {delta_r*100:+.2f} cm")
+        print(f"  Drift diff (ΔR−ΔL) = {drift_diff*100:+.2f} cm")
+        print(f"  Angular drift = {math.degrees(theta_rad):+.2f}°   → {direction}")
+        print(f"  IMU yaw change  = {math.degrees(imu_yaw_change):+.2f}°")
+        print(f"  Odom yaw change = {math.degrees(yaw_change):+.2f}°")
     else:
-        direction = "STRAIGHT"
-
-    print(f"\n  USS ΔL = {delta_l*100:+.2f} cm    ΔR = {delta_r*100:+.2f} cm")
-    print(f"  Drift diff (ΔR−ΔL) = {drift_diff*100:+.2f} cm")
-    print(f"  Angular drift = {math.degrees(theta_rad):+.2f}°   → {direction}")
-    print(f"  Odom yaw change = {math.degrees(yaw_change):+.2f}°")
+        theta_rad = imu_yaw_change
+        if theta_rad > math.radians(1.0):
+            direction = "LEFT"
+        elif theta_rad < -math.radians(1.0):
+            direction = "RIGHT"
+        print(f"\n  IMU yaw change  = {math.degrees(imu_yaw_change):+.2f}°   → {direction}")
+        print(f"  Odom yaw change = {math.degrees(yaw_change):+.2f}°")
 
     # Compute needed vel_trim:
     # The robot drifted theta_rad over distance enc_dist at speed drive_speed
@@ -675,6 +816,7 @@ def measure_drift(node: DriftCalibNode,
     print(f"  Computed vel_trim correction = {vel_trim:+.6f} m/s")
 
     return {
+        "drift_source": drift_source,
         "before_l": bl, "before_r": br,
         "after_l": al, "after_r": ar,
         "delta_l": delta_l, "delta_r": delta_r,
@@ -710,6 +852,10 @@ def main():
                         help="skip LiDAR/USS alignment (assume robot is facing wall)")
     parser.add_argument("--runtime-only", action="store_true",
                         help="write trim to firmware register only (no source changes)")
+    parser.add_argument("--drift-source", choices=("uss", "imu"), default="uss",
+                        help="how to estimate heading drift: ultrasonic differential or IMU yaw (default: uss)")
+    parser.add_argument("--no-auto-start-services", action="store_true",
+                        help="do not attempt to start required system services before waiting for topics")
     args = parser.parse_args()
 
     if args.flash:
@@ -730,6 +876,7 @@ def main():
     print(f"  MAX_WHEEL_SPEED_MS : {max_speed:.6f} m/s")
     print(f"  Drive speed        : {args.speed:.3f} m/s")
     print(f"  Passes             : {args.passes}")
+    print(f"  Drift source       : {args.drift_source}")
     print(f"  Sensor separation  : {args.sensor_sep*100:.1f} cm")
     if current_trim_fwd is not None:
         print(f"  Current VEL_TRIM_FWD_DEFAULT : {current_trim_fwd:+.6f} m/s")
@@ -740,20 +887,59 @@ def main():
     rclpy.init()
     node = DriftCalibNode()
 
-    # Wait for topics
-    print(f"\nWaiting for topics …", end=" ", flush=True)
-    avail = node.wait_topics(timeout=10.0)
-    missing = [k for k, v in avail.items() if not v]
+    print(f"\nChecking required services …")
+    services_ok = ensure_required_services(
+        args.drift_source,
+        auto_start=not args.no_auto_start_services,
+    )
+    if not services_ok:
+        node.destroy_node()
+        rclpy.shutdown()
+        return
+
+    required = ["odom", "scan", "joints"]
+    if args.drift_source == "uss":
+        required.extend(["uss_left", "uss_right"])
+    if args.drift_source == "imu":
+        required.append("imu")
+
+    def check_topics_once() -> tuple[dict[str, bool], list[str], bool]:
+        print(f"\nWaiting for topics …", end=" ", flush=True)
+        avail_local = node.wait_topics(timeout=10.0,
+                                       require_uss=(args.drift_source == "uss"),
+                                       require_imu=(args.drift_source == "imu"))
+        missing_local = [k for k in required if not avail_local.get(k, False)]
+        cmd_vel_ok = avail_local.get("cmd_vel_subscriber", False)
+        return avail_local, missing_local, cmd_vel_ok
+
+    avail, missing, cmd_vel_ok = check_topics_once()
+    if missing or not cmd_vel_ok:
+        if missing:
+            print(f"\n  {RED}Missing: {', '.join(missing)}{NC}")
+        if not cmd_vel_ok:
+            print(f"\n  {RED}No active subscriber on /cmd_vel{NC}")
+        if not args.no_auto_start_services:
+            print(f"  {YLW}Required telemetry is missing; attempting service restart recovery.{NC}")
+            if restart_required_services(args.drift_source):
+                avail, missing, cmd_vel_ok = check_topics_once()
+
     if missing:
         print(f"\n  {RED}Missing: {', '.join(missing)}{NC}")
         if "uss_left" in missing or "uss_right" in missing:
             print(f"  {YLW}USS service may not be running. Check: "
                   f"systemctl status pi-ultrasonic-dual.service{NC}")
-            node.destroy_node()
-            rclpy.shutdown()
-            return
-    else:
-        print("OK  (all topics responding)")
+        print(f"  {YLW}Required robot telemetry is not live. Start bringup before calibrating.{NC}")
+        node.destroy_node()
+        rclpy.shutdown()
+        return
+    if not cmd_vel_ok:
+        print(f"\n  {RED}No active subscriber on /cmd_vel{NC}")
+        print(f"  {YLW}The robot base is not currently accepting velocity commands. Start bringup and retry.{NC}")
+        node.destroy_node()
+        rclpy.shutdown()
+        return
+
+    print("OK  (all required topics responding)")
 
     results = []
 
@@ -762,26 +948,35 @@ def main():
             # ── Alignment ────────────────────────────────────────────────
             if not args.no_align:
                 align_to_wall(node)
-                align_fine_uss(node, sensor_sep=args.sensor_sep)
+                if args.drift_source == "uss":
+                    align_fine_uss(node, sensor_sep=args.sensor_sep)
+                else:
+                    print(f"\n{BLD}[Fine-align]{NC} Skipped in IMU mode.")
 
             # ── Space check ──────────────────────────────────────────────
-            d_wall = node.us_mean(n=5)
+            if args.drift_source == "imu":
+                d_wall = node.front_clearance()
+            else:
+                d_wall = node.us_mean(n=5)
             if d_wall is None:
-                print(f"  {RED}Cannot read USS distance{NC}")
+                source_name = "LiDAR" if args.drift_source == "imu" else "USS"
+                print(f"  {RED}Cannot read {source_name} distance{NC}")
                 continue
 
-            print(f"\n{BLD}[Space]{NC} Distance to wall: {d_wall*100:.1f} cm")
+            source_name = "LiDAR" if args.drift_source == "imu" else "USS"
+            print(f"\n{BLD}[Space]{NC} Distance to wall ({source_name}): {d_wall*100:.1f} cm")
 
             if d_wall * 100 < MIN_SPACE_M * 100:
                 print(f"  Too close ({d_wall*100:.0f} cm < {MIN_SPACE_M*100:.0f} cm). "
                       f"Reversing …")
                 target = MIN_SPACE_M * 1.1
-                if not backup_to_distance(node, target, wheel_radius):
+                if not backup_to_distance(node, target, wheel_radius,
+                                          clearance_source=args.drift_source):
                     print(f"  {RED}Could not create enough space.{NC}")
                     continue
 
                 # After backup, re-measure
-                d_wall = node.us_mean(n=5)
+                d_wall = node.front_clearance() if args.drift_source == "imu" else node.us_mean(n=5)
                 if d_wall is None:
                     continue
 
@@ -796,7 +991,7 @@ def main():
             # ── Measurement ──────────────────────────────────────────────
             result = measure_drift(
                 node, test_dist, args.speed, wheel_radius,
-                args.sensor_sep, pass_num, args.passes)
+                args.sensor_sep, args.drift_source, pass_num, args.passes)
 
             if result:
                 results.append(result)
@@ -823,7 +1018,7 @@ def main():
     trims = []
     for i, r in enumerate(results):
         theta_deg = math.degrees(r["theta_rad"])
-        print(f"  Pass {i+1}: θ = {theta_deg:+.2f}°  direction = {r['direction']}  "
+        print(f"  Pass {i+1} [{r['drift_source']}]: θ = {theta_deg:+.2f}°  direction = {r['direction']}  "
               f"vel_trim = {r['vel_trim']:+.6f} m/s")
         trims.append(r["vel_trim"])
 

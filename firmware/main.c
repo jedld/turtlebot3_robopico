@@ -123,7 +123,7 @@
 #define WHEEL_RADIUS_DEFAULT        0.034050f  // nominal — recalibrate with calibrate_distance.py
 // ANGULAR CALIBRATION: do NOT use a scale factor (it breaks odometry).
 // Tune WHEEL_SEPARATION to match effective turning base; run auto_calibrate_imu_turn.py.
-#define WHEEL_SEPARATION_DEFAULT    0.121642f  // metres — effective turning base; recalibrate after motor swap
+#define WHEEL_SEPARATION_DEFAULT    0.047940f  // metres — effective turning base; calibrated by auto_calibrate_imu_turn.py
 #define MAX_WHEEL_SPEED_MS_DEFAULT  0.074081f  // calibrated 2026-03-13: USS ground truth, correction=0.9203 (-8.0%)
 #define LEFT_MOTOR_REVERSED_DEFAULT  1       // CHAN_B = physical forward for left motor (M2)
 #define RIGHT_MOTOR_REVERSED_DEFAULT 0       // CHAN_A = physical forward for right motor (M1)
@@ -245,7 +245,7 @@
 //   v_left  += trim / 2
 //   v_right -= trim / 2
 // Positive = correct left drift (speed up left, slow right).
-#define VEL_TRIM_FWD_DEFAULT          0.014279f  // calibrated 2026-03-13: drift_calib, 3 iterations
+#define VEL_TRIM_FWD_DEFAULT          0.043939f  // calibrated 2026-03-15: drift_calib, trim=+0.000939
 #define VEL_TRIM_REV_DEFAULT         -0.002300f  // calibrated 2026-03-13: diagnose_reverse.py auto-tune
 // Preload the heading-hold integrator with the equivalent angular correction
 // implied by the learned velocity trim. This removes the multi-degree startup
@@ -701,7 +701,7 @@ static void init_registers(void) {
     // IMU-encoder complementary filter — enabled by default; weight α=0.98.
     // When no hardware IMU is present, fusion is auto-disabled regardless of this flag.
     w_f32(ADDR_IMU_HEADING_ALPHA, IMU_HEADING_COMP_ALPHA_DEFAULT);
-    regs[ADDR_IMU_HEADING_EN] = 1u;  // enabled by default
+    regs[ADDR_IMU_HEADING_EN] = 0u;  // enabled by default
     w_f32(ADDR_DBG_HEADING_FUSED, 0.0f);
     w_f32(ADDR_DBG_HEADING_GYRO, 0.0f);
     w_f32(ADDR_DBG_HEADING_ENC, 0.0f);
@@ -2149,14 +2149,6 @@ static bool init_bno085(void) {
 
 static bool    bno055_present      = false;
 static uint8_t bno055_runtime_addr = BNO055_ADDR_0;
-static float   bno055_yaw_rad      = 0.0f;
-static uint64_t bno055_last_gyro_us = 0u;
-
-static inline float wrap_pi_f(float a) {
-    while (a >  3.14159265358979323846f) a -= 6.28318530717958647692f;
-    while (a < -3.14159265358979323846f) a += 6.28318530717958647692f;
-    return a;
-}
 
 static bool bno055_write_reg(uint8_t reg, uint8_t val) {
     uint8_t buf[2] = { reg, val };
@@ -2303,8 +2295,6 @@ static bool init_bno055(void) {
 
         // Initialise calibration status register to 0 (uncalibrated).
         regs[ADDR_DBG_BNO055_CALIB] = 0x00u;
-        bno055_yaw_rad = 0.0f;
-        bno055_last_gyro_us = 0u;
         w_f32(ADDR_IMU_ORIENT_W, 1.0f);
         w_f32(ADDR_IMU_ORIENT_X, 0.0f);
         w_f32(ADDR_IMU_ORIENT_Y, 0.0f);
@@ -2345,21 +2335,20 @@ static void bno055_update(void) {
         w_f32(ADDR_IMU_ANG_VEL_X, gx_rad);
         w_f32(ADDR_IMU_ANG_VEL_Y, gy_rad);
         w_f32(ADDR_IMU_ANG_VEL_Z, gz_rad);
+    }
 
-        uint64_t now_us = time_us_64();
-        if (bno055_last_gyro_us != 0u) {
-            float dt = (float)(now_us - bno055_last_gyro_us) / 1e6f;
-            if (dt > 0.0f && dt < 0.25f) {
-                bno055_yaw_rad = wrap_pi_f(bno055_yaw_rad + gz_rad * dt);
-            }
-        }
-        bno055_last_gyro_us = now_us;
-
-        float half_yaw = 0.5f * bno055_yaw_rad;
-        w_f32(ADDR_IMU_ORIENT_W, cosf(half_yaw));
-        w_f32(ADDR_IMU_ORIENT_X, 0.0f);
-        w_f32(ADDR_IMU_ORIENT_Y, 0.0f);
-        w_f32(ADDR_IMU_ORIENT_Z, sinf(half_yaw));
+    // Fused quaternion W X Y Z — 0x20–0x27 (int16 Q14)
+    // Publish the sensor's full fused orientation instead of synthesizing a
+    // yaw-only quaternion from gyro-Z. That preserves real roll/pitch tilt.
+    if (bno055_read_regs(BNO055_QUA_DATA_W_LSB, buf, 8u)) {
+        int16_t qw = (int16_t)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8u));
+        int16_t qx = (int16_t)((uint16_t)buf[2] | ((uint16_t)buf[3] << 8u));
+        int16_t qy = (int16_t)((uint16_t)buf[4] | ((uint16_t)buf[5] << 8u));
+        int16_t qz = (int16_t)((uint16_t)buf[6] | ((uint16_t)buf[7] << 8u));
+        w_f32(ADDR_IMU_ORIENT_W, qw * BNO055_Q14_SCALE);
+        w_f32(ADDR_IMU_ORIENT_X, qx * BNO055_Q14_SCALE);
+        w_f32(ADDR_IMU_ORIENT_Y, qy * BNO055_Q14_SCALE);
+        w_f32(ADDR_IMU_ORIENT_Z, qz * BNO055_Q14_SCALE);
     }
 
     // Magnetometer X Y Z — 0x0E–0x13  (int16, 0.0625 µT per LSB → Tesla)

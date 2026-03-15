@@ -68,6 +68,12 @@ def quat_to_euler(x, y, z, w):
     yaw = math.atan2(siny_cosp, cosy_cosp)
     return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
 
+def accel_to_tilt(ax, ay, az):
+    """Return (roll, pitch) in degrees implied by gravity-inclusive accel."""
+    roll = math.atan2(ay, az)
+    pitch = math.atan2(-ax, math.sqrt(ay * ay + az * az))
+    return math.degrees(roll), math.degrees(pitch)
+
 def stdev(values):
     if len(values) < 2:
         return 0.0
@@ -125,6 +131,7 @@ def analyse(imu_samples, mag_samples):
                   last.angular_velocity.z)
 
     roll, pitch, yaw = quat_to_euler(ox, oy, oz, ow)
+    accel_roll, accel_pitch = accel_to_tilt(ax, ay, az)
     accel_mag = math.sqrt(ax**2 + ay**2 + az**2)
 
     print()
@@ -133,6 +140,7 @@ def analyse(imu_samples, mag_samples):
     print(f"  {'Euler (deg)':<20s}  roll={roll:+7.2f}°  pitch={pitch:+7.2f}°  yaw={yaw:+7.2f}°")
     print(fmt_vec3("Linear accel", ax, ay, az, "m/s²"))
     print(f"  {'|accel| magnitude':<20s}  {accel_mag:.4f} m/s²  (expected ~9.81)")
+    print(f"  {'Tilt from accel':<20s}  roll={accel_roll:+7.2f}°  pitch={accel_pitch:+7.2f}°")
     print(fmt_vec3("Angular velocity", gx, gy, gz, "rad/s"))
 
     # ── Magnetometer ─────────────────────────────────────────────────────────
@@ -247,6 +255,21 @@ def analyse(imu_samples, mag_samples):
     else:
         fail(f"|accel| = {mean_mag:.4f} m/s²  is OUTSIDE expected gravity range (9.0–10.6).")
         results_ok = False
+
+    # If the robot is visibly tilted according to gravity, the quaternion should
+    # report comparable roll/pitch. A yaw-only quaternion with tilted accel is a
+    # firmware regression: orientation fusion is being discarded upstream.
+    print()
+    print(f"{BLD}── Orientation consistency ─────────────────────────────────{NC}")
+    roll_err = abs(roll - accel_roll)
+    pitch_err = abs(pitch - accel_pitch)
+    tilt_mag = math.hypot(accel_roll, accel_pitch)
+    print(f"  {'Quat vs accel tilt':<20s}  d_roll={roll_err:6.2f}°  d_pitch={pitch_err:6.2f}°")
+    if accel_mag > 9.0 and tilt_mag > 5.0 and (roll_err > 6.0 or pitch_err > 6.0):
+        fail("Quaternion tilt disagrees with gravity vector — IMU orientation is likely yaw-only or stale.")
+        results_ok = False
+    else:
+        ok("Quaternion tilt is consistent with measured gravity.")
 
     # ── Covariance check ─────────────────────────────────────────────────────
     print()
