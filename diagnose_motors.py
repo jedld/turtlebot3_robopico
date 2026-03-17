@@ -132,7 +132,10 @@ def _read_response(ser, expected: int, timeout: float = 0.25) -> Optional[bytes]
     buf = b""
     while time.monotonic() - t0 < timeout:
         waiting = ser.in_waiting
-        chunk = ser.read(waiting if waiting > 0 else 1)
+        try:
+            chunk = ser.read(waiting if waiting > 0 else 1)
+        except Exception:
+            return None
         if chunk:
             buf += chunk
         while True:
@@ -163,22 +166,18 @@ def _send_vel_cmd(ser, v: float, a: float = 0.0) -> None:
     ang_val = int(round(a * 100.0))
     ser.write(_make_write_i32_pkt(REG_CMD_LINEAR_X, lin_val))
     time.sleep(0.003)
-    ser.read(max(ser.in_waiting, 1))
     ser.write(_make_write_i32_pkt(REG_CMD_ANGULAR_Z, ang_val))
     time.sleep(0.003)
-    ser.read(max(ser.in_waiting, 1))
 
 
 def _write_f32(ser, addr: int, value: float) -> None:
     ser.write(_make_write_f32_pkt(addr, value))
     time.sleep(0.003)
-    ser.read(max(ser.in_waiting, 1))
 
 
 def _write_u8(ser, addr: int, value: int) -> None:
     ser.write(_make_write_u8_pkt(addr, value))
     time.sleep(0.003)
-    ser.read(max(ser.in_waiting, 1))
 
 
 def _read_regs(ser) -> Optional[dict]:

@@ -17,8 +17,9 @@
  *
  * Hardware mapping (Cytron Robo Pico)
  * ------------------------------------
- *   Left  wheel : M1 — GP8  (M1A, forward), GP9  (M1B, reverse)
- *   Right wheel : M2 — GP10 (M2A, forward), GP11 (M2B, reverse)
+ *   Left  wheel : Motor 1 — Waveshare I2C motor driver, reg 0x10 (I2C slave 0x55)
+ *   Right wheel : Motor 2 — Waveshare I2C motor driver, reg 0x11 (I2C slave 0x55)
+ *   Motor I2C   : I2C1, GP2 (SDA) / GP3 (SCL), Grove 2 port, 400 kHz
  *   Button 1    : GP20 (active-low with internal pull-up)
  *   Button 2    : GP21 (active-low with internal pull-up)
  *   Buzzer      : GP22 (PWM variable-frequency)
@@ -64,10 +65,25 @@
 #define FIRMWARE_VERSION    1u
 
 // Cytron Robo Pico pin assignments
-#define PIN_M1A     8u
-#define PIN_M1B     9u
-#define PIN_M2A     10u
-#define PIN_M2B     11u
+
+// External Waveshare Pico Motor Driver — I2C slave on Grove 2 (GP2/GP3, I2C1)
+// The ROBO Pico built-in motor driver (GP8-GP11) is no longer used.
+#define MOTOR_I2C_PORT      i2c1
+#define MOTOR_I2C_SDA_PIN   2u    // GP2 = Grove 2, pin 1 (Yellow) — SDA
+#define MOTOR_I2C_SCL_PIN   3u    // GP3 = Grove 2, pin 2 (White)  — SCL
+#define MOTOR_I2C_HZ        400000u
+#define MOTOR_I2C_ADDR      0x55u
+// Timeout for I2C writes in the hot motor-control path (called at 50 Hz).
+// Must be well below the 20 ms odometry cycle so USB is not starved.
+// At 400 kHz, a 2-byte write takes ~45 µs; 500 µs allows ~10× margin.
+#define MOTOR_I2C_TIMEOUT_US  500u
+// Longer timeout used only at init (one-shot probe, USB not running yet).
+#define MOTOR_I2C_INIT_TIMEOUT_US  5000u
+// Waveshare motor driver register map (I2C register-based protocol)
+#define MOTOR_REG_MOTOR1    0x10u  // Left  wheel — signed int8: -100 (full rev) to +100 (full fwd)
+#define MOTOR_REG_MOTOR2    0x11u  // Right wheel — signed int8: -100 (full rev) to +100 (full fwd)
+#define MOTOR_REG_STOP      0x30u  // Emergency stop — write any value
+
 #define PIN_BTN1    20u
 #define PIN_BTN2    21u
 #define PIN_BUZZER  22u
@@ -96,10 +112,8 @@
 // Pico 2 system clock — use the SDK-defined SYS_CLK_HZ (150 MHz for RP2350).
 // Do not redefine; it comes from hardware/platform_defs.h.
 
-// Motor PWM: 10 kHz, 1000 resolution steps.
-// clkdiv = 15  →  150 MHz / 15 / 1000 = 10 kHz
-#define MOTOR_PWM_CLKDIV    15.0f
-#define MOTOR_PWM_WRAP      999u    // duty range: 0 … 999
+// Motor speed scale: throttle [-1.0, +1.0] maps to I2C slave value [-100, +100]
+#define MOTOR_I2C_SPEED_MAX  100
 
 // ============================================================
 // MOTOR / WHEEL / CHASSIS CONFIGURATION
@@ -125,25 +139,24 @@
 // Tune WHEEL_SEPARATION to match effective turning base; run auto_calibrate_imu_turn.py.
 #define WHEEL_SEPARATION_DEFAULT    0.047940f  // metres — effective turning base; calibrated by auto_calibrate_imu_turn.py
 #define MAX_WHEEL_SPEED_MS_DEFAULT  0.074081f  // calibrated 2026-03-13: USS ground truth, correction=0.9203 (-8.0%)
-#define LEFT_MOTOR_REVERSED_DEFAULT  1       // CHAN_B = physical forward for left motor (M2)
-#define RIGHT_MOTOR_REVERSED_DEFAULT 0       // CHAN_A = physical forward for right motor (M1)
-#define SWAP_LEFT_RIGHT_MOTORS_DEFAULT 1      // motors physically swapped: M1→right, M2→left
+#define LEFT_MOTOR_REVERSED_DEFAULT  1       // left motor also needs inverted polarity (M1=left)
+#define RIGHT_MOTOR_REVERSED_DEFAULT 1       // right motor needs inverted polarity (M2=right)
+#define SWAP_LEFT_RIGHT_MOTORS_DEFAULT 0      // M1=left, M2=right — no swap needed
 
 // Minimum duty cycle (dead-zone compensation).
-// JGA25-371 12V motor at ~5V supply — needs higher minimum duty to overcome
-// friction at reduced voltage.  Re-run calibrate_deadzone.py to fine-tune.
+// JGA25-371 12V motor at 12V supply.  Re-run calibrate_deadzone.py to fine-tune.
 // Any non-zero throttle is boosted to at least this value.
 // Set to 0.0f to disable.  Range: 0.0 – 1.0.
-#define MOTOR_MIN_DUTY_LEFT_DEFAULT   0.15f  // calibrated — calibrate_deadzone.py
-#define MOTOR_MIN_DUTY_RIGHT_DEFAULT  0.15f  // calibrated — calibrate_deadzone.py
+#define MOTOR_MIN_DUTY_LEFT_DEFAULT   0.05f  // calibrated — calibrate_deadzone.py (12V)
+#define MOTOR_MIN_DUTY_RIGHT_DEFAULT  0.05f  // calibrated — calibrate_deadzone.py (12V)
 
 // Kick-start: when a motor transitions from stopped to moving (or reverses
 // direction), apply KICK_DUTY for KICK_CYCLES odometry cycles to overcome
 // static friction, then settle to normal (dead-zone compensated) duty.
 // Particularly important for pivot turns where individual wheel velocities
 // are very small.  Set KICK_CYCLES to 0 to disable.
-#define MOTOR_KICK_DUTY_DEFAULT     0.20f  // calibrated — calibrate_deadzone.py
-#define MOTOR_KICK_CYCLES_DEFAULT   3u  // calibrated — calibrate_deadzone.py
+#define MOTOR_KICK_DUTY_DEFAULT     0.08f  // calibrated — calibrate_deadzone.py (12V)
+#define MOTOR_KICK_CYCLES_DEFAULT   2u  // calibrated — calibrate_deadzone.py (12V)
 
 // Per-motor throttle trim — compensates for manufacturing differences between
 // the left and right motors that cause the robot to drift sideways.
@@ -245,7 +258,7 @@
 //   v_left  += trim / 2
 //   v_right -= trim / 2
 // Positive = correct left drift (speed up left, slow right).
-#define VEL_TRIM_FWD_DEFAULT          0.043939f  // calibrated 2026-03-15: drift_calib, trim=+0.000939
+#define VEL_TRIM_FWD_DEFAULT          0.0f  // calibrated 2026-03-15: drift_calib, trim=-0.003851
 #define VEL_TRIM_REV_DEFAULT         -0.002300f  // calibrated 2026-03-13: diagnose_reverse.py auto-tune
 // Preload the heading-hold integrator with the equivalent angular correction
 // implied by the learned velocity trim. This removes the multi-degree startup
@@ -452,7 +465,7 @@ static bool load_calibration_from_flash(void) {
 // CONTROL TABLE  (register map — must be large enough for all defined ADDR_* + their width)
 // ============================================================
 
-#define REG_SIZE 360u
+#define REG_SIZE 368u
 static uint8_t regs[REG_SIZE];
 
 // --- typed register accessors --------------------------------
@@ -634,6 +647,22 @@ static inline void w_f32(uint addr, float v) {
 #define ADDR_DBG_ENC_TRIM  304u  // float (read-only)  — current per-wheel trim (m/s)
 #define ADDR_DBG_ENC_DIFF  308u  // float (read-only)  — accumulated L−R distance diff (m)
 
+// Motor I2C1 diagnostic registers (read-only, set by init_motors() at startup)
+// Allows the host to verify the Waveshare motor driver is visible on I2C1.
+#define ADDR_MOTOR_I2C_NDEV    344u  // 1 byte: I2C1 device count found at init
+#define ADDR_MOTOR_I2C_DEV0    345u  // 1 byte: first  found device address (0xFF=empty)
+#define ADDR_MOTOR_I2C_DEV1    346u  // 1 byte: second found device address
+#define ADDR_MOTOR_I2C_DEV2    347u  // 1 byte: third  found device address
+#define ADDR_MOTOR_I2C_STATUS  348u  // 1 byte: 0=slave 0x55 found, 1=not found, 0xFF=not yet inited
+#define ADDR_MOTOR_I2C_ERR_CNT 352u  // uint32: cumulative failed I2C write count
+
+// Motor I2C runtime diagnostics — updated during operation
+#define ADDR_MOTOR_LAST_CMD_M1  356u  // int8: last raw speed sent to Motor1 (two's-complement)
+#define ADDR_MOTOR_LAST_CMD_M2  357u  // int8: last raw speed sent to Motor2
+#define ADDR_MOTOR_DIRECT_M1    358u  // int8: write non-zero to bypass PID and drive Motor1 directly
+#define ADDR_MOTOR_DIRECT_M2    359u  // int8: write non-zero to bypass PID and drive Motor2 directly
+#define ADDR_MOTOR_WHO_AM_I     360u  // 1 byte: WHO_AM_I (reg 0x00) read from device at boot; 0xA4 = OK
+
 // Runtime diagnostics (read-only, addr 224–239)
 #define ADDR_DIAG_USB_TX_STALLS 224u  // uint32 — status packets dropped because USB TX stopped draining
 #define ADDR_DIAG_SENSOR_MAX_US 228u  // uint32 — worst-case update_sensors() runtime observed
@@ -709,6 +738,19 @@ static void init_registers(void) {
     // IMU gyro bias estimator — zero initial bias; converges online.
     w_f32(ADDR_IMU_HEADING_BIAS_BETA, IMU_HEADING_BIAS_BETA_DEFAULT);
     w_f32(ADDR_DBG_GYRO_BIAS, 0.0f);
+
+    // Motor I2C1 diagnostics — sentinel until init_motors() runs
+    regs[ADDR_MOTOR_I2C_NDEV]    = 0u;
+    regs[ADDR_MOTOR_I2C_DEV0]    = 0xFFu;
+    regs[ADDR_MOTOR_I2C_DEV1]    = 0xFFu;
+    regs[ADDR_MOTOR_I2C_DEV2]    = 0xFFu;
+    regs[ADDR_MOTOR_I2C_STATUS]  = 0xFFu;  // 0xFF = not yet set
+    w_i32(ADDR_MOTOR_I2C_ERR_CNT, 0);
+    regs[ADDR_MOTOR_LAST_CMD_M1] = 0;
+    regs[ADDR_MOTOR_LAST_CMD_M2] = 0;
+    regs[ADDR_MOTOR_DIRECT_M1]   = 0;
+    regs[ADDR_MOTOR_DIRECT_M2]   = 0;
+    regs[ADDR_MOTOR_WHO_AM_I]    = 0xFFu;  // 0xFF until init_motors() runs
 
     // Battery initial placeholder — updated to real GPIO reading within first 50 ms.
     // Default to "on battery, mid-charge" (14.80 V, 50 %) until first sensor tick.
@@ -1105,6 +1147,23 @@ static void handle_write(uint8_t dev_id, const uint8_t *params, uint16_t nparams
         w_i32(ADDR_DIAG_VEL_WRITES, (int32_t)(vc + 1));
     }
 
+    // Direct motor bypass — write a raw int8 speed directly to the Waveshare board,
+    // completely bypassing the PID and host-timeout safety.  Useful for diagnosis.
+    if (addr <= ADDR_MOTOR_DIRECT_M2 && write_end > ADDR_MOTOR_DIRECT_M1) {
+        if (addr <= ADDR_MOTOR_DIRECT_M1 && write_end > ADDR_MOTOR_DIRECT_M1) {
+            int8_t m1 = (int8_t)regs[ADDR_MOTOR_DIRECT_M1];
+            uint8_t b1[2] = { MOTOR_REG_MOTOR1, (uint8_t)m1 };
+            i2c_write_timeout_us(MOTOR_I2C_PORT, MOTOR_I2C_ADDR, b1, 2, false, MOTOR_I2C_TIMEOUT_US);
+            regs[ADDR_MOTOR_LAST_CMD_M1] = (uint8_t)m1;
+        }
+        if (addr <= ADDR_MOTOR_DIRECT_M2 && write_end > ADDR_MOTOR_DIRECT_M2) {
+            int8_t m2 = (int8_t)regs[ADDR_MOTOR_DIRECT_M2];
+            uint8_t b2[2] = { MOTOR_REG_MOTOR2, (uint8_t)m2 };
+            i2c_write_timeout_us(MOTOR_I2C_PORT, MOTOR_I2C_ADDR, b2, 2, false, MOTOR_I2C_TIMEOUT_US);
+            regs[ADDR_MOTOR_LAST_CMD_M2] = (uint8_t)m2;
+        }
+    }
+
     if (send_reply) {
         uint32_t len = build_status(dev_id, 0x00, NULL, 0);
         send_packet(len);
@@ -1275,7 +1334,7 @@ static void parse_byte(uint8_t b) {
 // MOTOR CONTROL
 // ============================================================
 
-static uint pwm_slice_m1, pwm_slice_m2;
+static bool motor_driver_present = false;  // true if Waveshare I2C slave responded at init
 
 // Per-motor state for kick-start detection.
 // dir: -1 = reverse, 0 = stopped, +1 = forward
@@ -1288,29 +1347,51 @@ typedef struct {
 static motor_state_t motor_state[2] = {{0, 0}, {0, 0}};
 
 static void init_motors(void) {
-    // GP8/GP9 are on the same PWM slice (each pair shares a slice)
-    gpio_set_function(PIN_M1A, GPIO_FUNC_PWM);
-    gpio_set_function(PIN_M1B, GPIO_FUNC_PWM);
-    gpio_set_function(PIN_M2A, GPIO_FUNC_PWM);
-    gpio_set_function(PIN_M2B, GPIO_FUNC_PWM);
+    // Initialise I2C1 on Grove 2 (GP2=SDA, GP3=SCL) for the Waveshare motor driver.
+    i2c_init(MOTOR_I2C_PORT, MOTOR_I2C_HZ);
+    gpio_set_function(MOTOR_I2C_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(MOTOR_I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(MOTOR_I2C_SDA_PIN);
+    gpio_pull_up(MOTOR_I2C_SCL_PIN);
 
-    pwm_slice_m1 = pwm_gpio_to_slice_num(PIN_M1A);
-    pwm_slice_m2 = pwm_gpio_to_slice_num(PIN_M2A);
-
-    // Configure both slices: 10 kHz, wrap=999
-    for (uint s = pwm_slice_m1; s <= pwm_slice_m2; s++) {
-        pwm_set_clkdiv(s, MOTOR_PWM_CLKDIV);
-        pwm_set_wrap(s, MOTOR_PWM_WRAP);
-        pwm_set_chan_level(s, PWM_CHAN_A, 0);
-        pwm_set_chan_level(s, PWM_CHAN_B, 0);
-        pwm_set_enabled(s, true);
+    // Probe — try to read one byte from the slave (WHO_AM_I register 0x00).
+    uint8_t probe_reg = 0x00u;
+    uint8_t probe_val = 0;
+    int ret = i2c_write_timeout_us(MOTOR_I2C_PORT, MOTOR_I2C_ADDR, &probe_reg, 1, true, MOTOR_I2C_INIT_TIMEOUT_US);
+    if (ret == 1) {
+        ret = i2c_read_timeout_us(MOTOR_I2C_PORT, MOTOR_I2C_ADDR, &probe_val, 1, false, MOTOR_I2C_INIT_TIMEOUT_US);
+        motor_driver_present = (ret == 1);
+        regs[ADDR_MOTOR_WHO_AM_I] = probe_val;  // 0xA4 expected for genuine Waveshare board
     }
+
+    // Ensure motors are stopped at startup regardless of probe result.
+    uint8_t stop_cmd[2] = { MOTOR_REG_STOP, 0x01u };
+    i2c_write_timeout_us(MOTOR_I2C_PORT, MOTOR_I2C_ADDR, stop_cmd, 2, false, MOTOR_I2C_INIT_TIMEOUT_US);
+
+    // Scan I2C1 and record all responding devices in diagnostic registers.
+    // This lets the host verify that the motor driver slave is visible on the bus.
+    uint8_t nfound = 0;
+    uint8_t dev_regs[3] = { 0xFFu, 0xFFu, 0xFFu };
+    for (uint8_t addr = 0x08u; addr <= 0x77u && nfound < 3u; addr++) {
+        uint8_t dummy;
+        int r = i2c_read_timeout_us(MOTOR_I2C_PORT, addr, &dummy, 1u, false, MOTOR_I2C_INIT_TIMEOUT_US);
+        if (r == 1) {
+            dev_regs[nfound++] = addr;
+        }
+    }
+    regs[ADDR_MOTOR_I2C_NDEV]   = nfound;
+    regs[ADDR_MOTOR_I2C_DEV0]   = dev_regs[0];
+    regs[ADDR_MOTOR_I2C_DEV1]   = dev_regs[1];
+    regs[ADDR_MOTOR_I2C_DEV2]   = dev_regs[2];
+    regs[ADDR_MOTOR_I2C_STATUS] = motor_driver_present ? 0u : 1u;
 }
 
-// Drive one motor given a throttle in [-1.0, +1.0].
-// reversed: set true to invert direction for that motor.
+// Drive one motor via I2C to the Waveshare motor driver slave.
+// i2c_reg:   MOTOR_REG_MOTOR1 or MOTOR_REG_MOTOR2
+// reversed:  set true to invert direction for that motor
+// throttle:  desired speed in [-1.0, +1.0]
 // motor_idx: 0 = left, 1 = right (for kick-start state tracking)
-static void set_motor(uint slice, bool reversed, float throttle, int motor_idx) {
+static void set_motor(uint8_t i2c_reg, bool reversed, float throttle, int motor_idx) {
     if (throttle < -1.0f) throttle = -1.0f;
     if (throttle >  1.0f) throttle =  1.0f;
     if (reversed) throttle = -throttle;
@@ -1341,7 +1422,7 @@ static void set_motor(uint slice, bool reversed, float throttle, int motor_idx) 
         if (mag > 1.0f) mag = 1.0f;
     }
 
-    // Kick-start: override duty during the kick window
+    // Kick-start: override magnitude during the kick window
     if (ms->kick_remaining > 0 && mag > 0.001f) {
         if (mag < cfg_motor_kick_duty) {
             mag = cfg_motor_kick_duty;
@@ -1349,24 +1430,32 @@ static void set_motor(uint slice, bool reversed, float throttle, int motor_idx) 
         ms->kick_remaining--;
     }
 
-    uint16_t duty = (uint16_t)(mag * MOTOR_PWM_WRAP);
+    // Convert normalised magnitude to signed int8 speed: 0–100 for the slave.
+    // Speed encoding: +100 = 0x64 (full forward), -100 = 0x9C (full reverse), 0 = stop.
+    int8_t speed;
+    if (new_dir > 0)      speed = (int8_t)( mag * (float)MOTOR_I2C_SPEED_MAX + 0.5f);
+    else if (new_dir < 0) speed = (int8_t)(-mag * (float)MOTOR_I2C_SPEED_MAX - 0.5f);
+    else                  speed = 0;
 
-    if (new_dir > 0) {
-        pwm_set_chan_level(slice, PWM_CHAN_A, duty);  // forward
-        pwm_set_chan_level(slice, PWM_CHAN_B, 0);
-    } else if (new_dir < 0) {
-        pwm_set_chan_level(slice, PWM_CHAN_A, 0);
-        pwm_set_chan_level(slice, PWM_CHAN_B, duty);  // reverse
+    uint8_t buf[2] = { i2c_reg, (uint8_t)speed };
+    int wr = i2c_write_timeout_us(MOTOR_I2C_PORT, MOTOR_I2C_ADDR, buf, 2, false, MOTOR_I2C_TIMEOUT_US);
+    if (wr == 2) {
+        // Record last successfully sent speed for diagnostics
+        regs[(i2c_reg == MOTOR_REG_MOTOR1) ? ADDR_MOTOR_LAST_CMD_M1 : ADDR_MOTOR_LAST_CMD_M2] = (uint8_t)speed;
     } else {
-        // Brake (both low = coasting)
-        pwm_set_chan_level(slice, PWM_CHAN_A, 0);
-        pwm_set_chan_level(slice, PWM_CHAN_B, 0);
+        // Track failed writes — helps diagnose I2C wiring/power issues at runtime.
+        uint32_t ec = (uint32_t)r_i32(ADDR_MOTOR_I2C_ERR_CNT);
+        w_i32(ADDR_MOTOR_I2C_ERR_CNT, (int32_t)(ec + 1u));
     }
 }
 
 static void brake_all(void) {
-    set_motor(pwm_slice_m1, false, 0.0f, 0);
-    set_motor(pwm_slice_m2, false, 0.0f, 1);
+    // Send emergency stop command to the I2C motor driver (halts all motors instantly).
+    uint8_t stop_cmd[2] = { MOTOR_REG_STOP, 0x01u };
+    i2c_write_timeout_us(MOTOR_I2C_PORT, MOTOR_I2C_ADDR, stop_cmd, 2, false, MOTOR_I2C_TIMEOUT_US);
+    // Reset kick-start state so the next motion command starts clean.
+    motor_state[0].dir = 0;  motor_state[0].kick_remaining = 0;
+    motor_state[1].dir = 0;  motor_state[1].kick_remaining = 0;
 }
 
 // ============================================================
@@ -2734,7 +2823,7 @@ static void update_odometry(float dt) {
     float err_l = v_left  - filt_v_l;   // use filtered velocity for PID
     float err_r = v_right - filt_v_r;
 
-    if (fabsf(v_left) < 0.001f || !torque_on) {
+    if (fabsf(v_left) < 0.002f || !torque_on) {
         // Target zero (or torque off): reset controller cleanly.
         pid_output[0]     = 0.0f;
         pid_prev_error[0] = 0.0f;
@@ -2750,11 +2839,13 @@ static void update_odometry(float dt) {
             pid_output[0] = 0.0f;
             pid_prev_error[0] = 0.0f;
         }
-        // Feedforward seed: when output is zero (start-from-rest), initialise at the
-        // open-loop estimate so the motor starts spinning on the first cycle instead
-        // of waiting for the integrator to ramp up from 0.
+        // Feedforward seed: when output is near zero (start-from-rest), give it a
+        // small nudge so the PID has something to build on.  Keep the seed tiny
+        // because set_motor() already applies dead-zone expansion (maps any
+        // non-zero throttle up to cfg_motor_min_duty).  Using min_duty here
+        // would double-dip and cause an aggressive initial burst.
         if (fabsf(pid_output[0]) < 0.001f) {
-            pid_output[0] = cmd_sign_l * cfg_motor_min_duty_left;
+            pid_output[0] = cmd_sign_l * 0.01f;
         }
         pid_output[0] += kp * (err_l - pid_prev_error[0]) + ki * err_l * safe_dt;
         if (pid_output[0] >  PID_OUTPUT_MAX) pid_output[0] =  PID_OUTPUT_MAX;
@@ -2762,7 +2853,8 @@ static void update_odometry(float dt) {
     }
     pid_prev_error[0] = err_l;
 
-    if (fabsf(v_right) < 0.001f || !torque_on) {
+    if (fabsf(v_right) < 0.002f || !torque_on) {
+        // Target zero (or torque off): reset controller cleanly.
         pid_output[1]     = 0.0f;
         pid_prev_error[1] = 0.0f;
         filt_v_r           = 0.0f;  // reset velocity filter
@@ -2774,8 +2866,9 @@ static void update_odometry(float dt) {
             pid_output[1] = 0.0f;
             pid_prev_error[1] = 0.0f;
         }
+        // Small feedforward seed — set_motor() handles dead-zone expansion.
         if (fabsf(pid_output[1]) < 0.001f) {
-            pid_output[1] = cmd_sign_r * cfg_motor_min_duty_right;
+            pid_output[1] = cmd_sign_r * 0.01f;
         }
         pid_output[1] += kp * (err_r - pid_prev_error[1]) + ki * err_r * safe_dt;
         if (pid_output[1] >  PID_OUTPUT_MAX) pid_output[1] =  PID_OUTPUT_MAX;
@@ -2791,11 +2884,13 @@ static void update_odometry(float dt) {
         float thr_l = pid_output[0];
         float thr_r = pid_output[1];
         if (cfg_swap_left_right_motors) {
-            set_motor(pwm_slice_m1, cfg_right_motor_reversed != 0u, thr_r, 1);
-            set_motor(pwm_slice_m2, cfg_left_motor_reversed  != 0u, thr_l, 0);
+            // Swapped: Motor1 connector drives right wheel, Motor2 connector drives left wheel
+            set_motor(MOTOR_REG_MOTOR1, cfg_right_motor_reversed != 0u, thr_r, 1);
+            set_motor(MOTOR_REG_MOTOR2, cfg_left_motor_reversed  != 0u, thr_l, 0);
         } else {
-            set_motor(pwm_slice_m1, cfg_left_motor_reversed  != 0u, thr_l, 0);
-            set_motor(pwm_slice_m2, cfg_right_motor_reversed != 0u, thr_r, 1);
+            // Default: Motor1 = left wheel, Motor2 = right wheel
+            set_motor(MOTOR_REG_MOTOR1, cfg_left_motor_reversed  != 0u, thr_l, 0);
+            set_motor(MOTOR_REG_MOTOR2, cfg_right_motor_reversed != 0u, thr_r, 1);
         }
         gpio_put(PIN_LED, (fabsf(thr_l) > 0.001f || fabsf(thr_r) > 0.001f));
     } else {
@@ -3032,8 +3127,7 @@ int main(void) {
     // If flash is empty/corrupt, defaults remain active.
     load_calibration_from_flash();
 
-    // Hardware init
-    init_motors();
+    // Hardware init (motors deferred until after USB is up — see below)
     init_buttons();
     init_ups_gpio();
     init_buzzer();
@@ -3053,6 +3147,9 @@ int main(void) {
     board_init();
     tud_init(0);
 
+    // Init motors AFTER USB is up so I2C probe timeouts don't stall enumeration.
+    init_motors();
+
     // Init PIO quadrature encoders.  PIO has its own IRQ line (PIO0_IRQ_0),
     // independent of GPIO Bank0 IRQs, so order relative to board_init() is
     // not critical — but we keep it here for consistency.
@@ -3062,7 +3159,7 @@ int main(void) {
     // before the IMU probe so the ~500 ms calibration wait runs after the melody.
     play_melody_blocking(MEL_ON);
 
-    // Probe IMU — BNO085/BNO055 on Grove 2 (GP2/GP3, I2C1).
+    // Probe IMU — BNO085/BNO055 on Grove 1 (GP0/GP1, I2C0).
     // IMU bring-up — behaviour controlled by the IMU_TYPE compile flag.
 #if IMU_TYPE == 3
     // SIMULATED: skip all hardware; leave IMU source = 0.

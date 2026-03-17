@@ -36,18 +36,31 @@ the first PING in **< 10 ms** from any point after USB enumeration.
 
 | Signal | GPIO | Notes |
 |---|---|---|
-| Left motor A (forward) | GP8 | M1A |
-| Left motor B (reverse) | GP9 | M1B |
-| Right motor A (forward) | GP10 | M2A |
-| Right motor B (reverse) | GP11 | M2B |
+| Motor I2C SDA (Grove 2) | GP2 | I2C1 SDA — Waveshare motor driver slave |
+| Motor I2C SCL (Grove 2) | GP3 | I2C1 SCL — Waveshare motor driver slave (0x55) |
+| IMU SDA (Grove 1) | GP0 | I2C0 SDA — BNO055 |
+| IMU SCL (Grove 1) | GP1 | I2C0 SCL — BNO055 |
 | Button 1 | GP20 | active-low, internal pull-up |
 | Button 2 | GP21 | active-low, internal pull-up |
 | Buzzer | GP22 | variable-frequency PWM |
 | Onboard LED | GP25 | motor-activity indicator |
-| Ultrasonic 1 (Grove 2 SIG) | GP2 | Grove Ultrasonic Ranger V2.0 single-wire SIG |
-| Ultrasonic 2 (Grove 3 SIG) | GP4 | Grove Ultrasonic Ranger V2.0 single-wire SIG |
-| Battery ADC | GP28 | Vbatt via 2:1 divider (solder pad) |
+| Right encoder A (Grove 3) | GP4 | quadrature encoder channel A |
+| Right encoder B (Grove 3) | GP5 | quadrature encoder channel B |
+| Left encoder A (Grove 4) | GP16 | quadrature encoder channel A |
+| Left encoder B (Grove 4) | GP17 | quadrature encoder channel B |
+| UPS PLD (Grove 6) | GP26 | X-UPS1 power-loss detect (active-high) |
+| UPS LBAT (Grove 6) | GP27 | X-UPS1 low-battery signal (active-high) |
 | VSYS monitor | GP29 | VSYS via 3:1 resistor divider |
+
+### Motor wiring (Waveshare Pico Motor Driver)
+
+| External board channel | Wheel | I2C register |
+|---|---|---|
+| Motor A (channel 1) | Left wheel | 0x10 |
+| Motor B (channel 2) | Right wheel | 0x11 |
+
+Connect Grove 2 on the Robo Pico to the I2C1 breakout header on the Waveshare
+board (GP14=SDA, GP15=SCL on the Waveshare side). Both boards must share GND.
 
 ---
 

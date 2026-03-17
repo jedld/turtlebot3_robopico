@@ -20,6 +20,16 @@ ADDR_DIAG_CRC_FAIL = 244
 ADDR_DIAG_VEL_WRITES = 248
 ADDR_DIAG_READ_COUNT = 252
 
+ADDR_MOTOR_I2C_NDEV    = 344
+ADDR_MOTOR_I2C_DEV0    = 345
+ADDR_MOTOR_I2C_DEV1    = 346
+ADDR_MOTOR_I2C_DEV2    = 347
+ADDR_MOTOR_I2C_STATUS  = 348
+ADDR_MOTOR_I2C_ERR_CNT = 352
+ADDR_MOTOR_LAST_CMD_M1 = 356   # int8: last raw speed sent to Motor1
+ADDR_MOTOR_LAST_CMD_M2 = 357   # int8: last raw speed sent to Motor2
+ADDR_MOTOR_WHO_AM_I    = 360   # uint8: WHO_AM_I from device; 0xA4 = genuine Waveshare
+
 CRC_TABLE = []
 for i in range(256):
     c = i << 8
@@ -101,6 +111,30 @@ def main():
     values = struct.unpack("<8i", data)
     for name, value in zip(names, values):
         print(f"{name:16s}: {value}")
+
+    # Motor I2C1 diagnostics (addr 344-360)
+    mdata = dxl_read(ser, ADDR_MOTOR_I2C_NDEV, 17)
+    if mdata and len(mdata) >= 17:
+        ndev    = mdata[0]
+        devs    = [mdata[i] for i in range(1, 4) if mdata[i] != 0xFF]
+        status  = mdata[4]
+        err_cnt = struct.unpack_from("<I", mdata, 8)[0]
+        m1_last = struct.unpack_from("<b", mdata, 12)[0]
+        m2_last = struct.unpack_from("<b", mdata, 13)[0]
+        who_am_i = mdata[16]
+        print()
+        print(f"{'motor_i2c_ndev':16s}: {ndev}  (devices found on I2C1/Grove2)")
+        dev_strs = [f"0x{d:02X}" for d in devs]
+        print(f"{'motor_i2c_devs':16s}: {dev_strs if dev_strs else '(none)'}")
+        status_str = {0: "OK (0x55 responded)", 1: "FAIL (0x55 not found)", 0xFF: "not yet init"}.get(status, f"unknown ({status})")
+        print(f"{'motor_i2c_status':16s}: {status_str}")
+        print(f"{'motor_i2c_errors':16s}: {err_cnt}")
+        print(f"{'motor_last_cmd_m1':16s}: {m1_last:+d}  (last raw int8 to Motor1 register)")
+        print(f"{'motor_last_cmd_m2':16s}: {m2_last:+d}  (last raw int8 to Motor2 register)")
+        who_str = f"0x{who_am_i:02X}" + (" (OK)" if who_am_i == 0xA4 else " (expected 0xA4)" if who_am_i != 0xFF else " (not read)")
+        print(f"{'motor_who_am_i':16s}: {who_str}")
+    else:
+        print("\nmotor_i2c diag : (no response — old firmware?)")
 
     ser.close()
     return 0
