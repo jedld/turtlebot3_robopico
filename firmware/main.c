@@ -138,7 +138,7 @@
 // ANGULAR CALIBRATION: do NOT use a scale factor (it breaks odometry).
 // Tune WHEEL_SEPARATION to match effective turning base; run auto_calibrate_imu_turn.py.
 #define WHEEL_SEPARATION_DEFAULT    0.048585f  // metres — effective turning base; calibrated by auto_calibrate_imu_turn.py
-#define MAX_WHEEL_SPEED_MS_DEFAULT  0.074081f  // calibrated 2026-03-13: USS ground truth, correction=0.9203 (-8.0%)
+#define MAX_WHEEL_SPEED_MS_DEFAULT  0.067899f  // calibrated 2026-03-18: USS ground truth, correction=0.9165 (-8.3%)
 #define LEFT_MOTOR_REVERSED_DEFAULT  1       // left motor also needs inverted polarity (M1=left)
 #define RIGHT_MOTOR_REVERSED_DEFAULT 1       // right motor needs inverted polarity (M2=right)
 #define SWAP_LEFT_RIGHT_MOTORS_DEFAULT 0      // M1=left, M2=right — no swap needed
