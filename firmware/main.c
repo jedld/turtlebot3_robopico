@@ -124,9 +124,9 @@
 //   Motor : JGA25-371 DC Gearmotor (30:1 gear ratio, 12 V / 200 RPM)
 //           Running at ~5 V from Robo Pico → ~83 RPM actual
 //   Encoder: Hall-effect, 11 PPR motor shaft, X4 quadrature → 1320 counts/wheel-rev
-//   Wheel : Cytron Small Robot Rubber Wheel 65×26.5 mm (68.1 mm OD with tyre)
+//   Wheel : Cytron Small Robot Rubber Wheel 65×26.5 mm (68 mm OD with tyre)
 //           https://www.cytron.io/p-small-robot-rubber-wheel-65x26.5mm
-//   Chassis: Custom, 13.5 cm wheel-to-wheel separation
+//   Chassis: Custom, 14.65 cm (146.5 mm) wheel-to-wheel separation
 //
 // To change configuration, edit the values below and rebuild.
 // The same wheel_radius and wheel_separation must also be set
@@ -134,10 +134,10 @@
 //   turtlebot3_bringup/param/humble/burger.yaml
 // ============================================================
 
-#define WHEEL_RADIUS_DEFAULT        0.034050f  // nominal — recalibrate with calibrate_distance.py
+#define WHEEL_RADIUS_DEFAULT        0.034000f  // 68 mm diameter / 2 — recalibrate with calibrate_distance.py
 // ANGULAR CALIBRATION: do NOT use a scale factor (it breaks odometry).
 // Tune WHEEL_SEPARATION to match effective turning base; run auto_calibrate_imu_turn.py.
-#define WHEEL_SEPARATION_DEFAULT    0.048585f  // metres — effective turning base; calibrated by auto_calibrate_imu_turn.py
+#define WHEEL_SEPARATION_DEFAULT    0.146500f  // metres — physical track width 146.5 mm; recalibrate with auto_calibrate_imu_turn.py
 #define MAX_WHEEL_SPEED_MS_DEFAULT  0.067899f  // calibrated 2026-03-18: USS ground truth, correction=0.9165 (-8.3%)
 #define LEFT_MOTOR_REVERSED_DEFAULT  1       // left motor also needs inverted polarity (M1=left)
 #define RIGHT_MOTOR_REVERSED_DEFAULT 1       // right motor needs inverted polarity (M2=right)
@@ -465,7 +465,7 @@ static bool load_calibration_from_flash(void) {
 // CONTROL TABLE  (register map — must be large enough for all defined ADDR_* + their width)
 // ============================================================
 
-#define REG_SIZE 368u
+#define REG_SIZE 376u
 static uint8_t regs[REG_SIZE];
 
 // --- typed register accessors --------------------------------
@@ -662,6 +662,12 @@ static inline void w_f32(uint addr, float v) {
 #define ADDR_MOTOR_DIRECT_M1    358u  // int8: write non-zero to bypass PID and drive Motor1 directly
 #define ADDR_MOTOR_DIRECT_M2    359u  // int8: write non-zero to bypass PID and drive Motor2 directly
 #define ADDR_MOTOR_WHO_AM_I     360u  // 1 byte: WHO_AM_I (reg 0x00) read from device at boot; 0xA4 = OK
+#define ADDR_MOTOR_I2C_RECOVERY_CNT 364u  // uint32: number of I2C bus recovery attempts
+
+// I2C bus recovery: if consecutive errors exceed this threshold, bit-bang
+// SCL to unstick the bus, re-init I2C, and re-probe the motor driver.
+#define MOTOR_I2C_ERR_RECOVERY_THRESHOLD  50u
+#define MOTOR_I2C_RECOVERY_COOLDOWN_US    2000000u  // 2 s between recovery attempts
 
 // Runtime diagnostics (read-only, addr 224–239)
 #define ADDR_DIAG_USB_TX_STALLS 224u  // uint32 — status packets dropped because USB TX stopped draining
@@ -751,6 +757,7 @@ static void init_registers(void) {
     regs[ADDR_MOTOR_DIRECT_M1]   = 0;
     regs[ADDR_MOTOR_DIRECT_M2]   = 0;
     regs[ADDR_MOTOR_WHO_AM_I]    = 0xFFu;  // 0xFF until init_motors() runs
+    w_i32(ADDR_MOTOR_I2C_RECOVERY_CNT, 0);
 
     // Battery initial placeholder — updated to real GPIO reading within first 50 ms.
     // Default to "on battery, mid-charge" (14.80 V, 50 %) until first sensor tick.
@@ -1335,6 +1342,8 @@ static void parse_byte(uint8_t b) {
 // ============================================================
 
 static bool motor_driver_present = false;  // true if Waveshare I2C slave responded at init
+static uint32_t motor_i2c_err_snapshot = 0;  // error count at last recovery check
+static uint64_t motor_i2c_last_recovery_us = 0;  // timestamp of last recovery attempt
 
 // Per-motor state for kick-start detection.
 // dir: -1 = reverse, 0 = stopped, +1 = forward
@@ -1345,6 +1354,86 @@ typedef struct {
 } motor_state_t;
 
 static motor_state_t motor_state[2] = {{0, 0}, {0, 0}};
+
+// Bit-bang SCL to release a stuck I2C slave that is holding SDA low.
+// If a slave was mid-byte when the bus was interrupted, clocking SCL
+// up to 9 times lets it finish and release SDA.
+static void i2c_bus_recover(void) {
+    // Temporarily revert pins from I2C peripheral to GPIO
+    gpio_set_function(MOTOR_I2C_SDA_PIN, GPIO_FUNC_SIO);
+    gpio_set_function(MOTOR_I2C_SCL_PIN, GPIO_FUNC_SIO);
+    gpio_set_dir(MOTOR_I2C_SDA_PIN, GPIO_IN);   // SDA as input (read state)
+    gpio_set_dir(MOTOR_I2C_SCL_PIN, GPIO_OUT);   // SCL as output (bit-bang)
+    gpio_pull_up(MOTOR_I2C_SDA_PIN);
+    gpio_pull_up(MOTOR_I2C_SCL_PIN);
+
+    // Clock up to 9 pulses on SCL to unstick the slave
+    for (int i = 0; i < 9; i++) {
+        if (gpio_get(MOTOR_I2C_SDA_PIN)) {
+            break;  // SDA released — bus is free
+        }
+        gpio_put(MOTOR_I2C_SCL_PIN, false);
+        sleep_us(5);
+        gpio_put(MOTOR_I2C_SCL_PIN, true);
+        sleep_us(5);
+    }
+
+    // Generate a STOP condition: SDA low→high while SCL is high
+    gpio_set_dir(MOTOR_I2C_SDA_PIN, GPIO_OUT);
+    gpio_put(MOTOR_I2C_SDA_PIN, false);
+    sleep_us(5);
+    gpio_put(MOTOR_I2C_SCL_PIN, true);
+    sleep_us(5);
+    gpio_put(MOTOR_I2C_SDA_PIN, true);
+    sleep_us(5);
+
+    // Re-init the I2C peripheral (this reclaims the pins)
+    i2c_deinit(MOTOR_I2C_PORT);
+    i2c_init(MOTOR_I2C_PORT, MOTOR_I2C_HZ);
+    gpio_set_function(MOTOR_I2C_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(MOTOR_I2C_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(MOTOR_I2C_SDA_PIN);
+    gpio_pull_up(MOTOR_I2C_SCL_PIN);
+}
+
+// Attempt to recover the I2C bus and re-probe the motor driver.
+// Called when the error count exceeds the threshold.
+static void attempt_motor_i2c_recovery(void) {
+    uint64_t now = time_us_64();
+    if ((now - motor_i2c_last_recovery_us) < MOTOR_I2C_RECOVERY_COOLDOWN_US) {
+        return;  // too soon since last recovery
+    }
+    motor_i2c_last_recovery_us = now;
+
+    // Increment recovery counter
+    uint32_t rc = (uint32_t)r_i32(ADDR_MOTOR_I2C_RECOVERY_CNT);
+    w_i32(ADDR_MOTOR_I2C_RECOVERY_CNT, (int32_t)(rc + 1u));
+
+    // Bit-bang recovery
+    i2c_bus_recover();
+
+    // Re-probe the motor driver
+    uint8_t probe_reg = 0x00u;
+    uint8_t probe_val = 0;
+    int ret = i2c_write_timeout_us(MOTOR_I2C_PORT, MOTOR_I2C_ADDR, &probe_reg, 1, true, MOTOR_I2C_INIT_TIMEOUT_US);
+    if (ret == 1) {
+        ret = i2c_read_timeout_us(MOTOR_I2C_PORT, MOTOR_I2C_ADDR, &probe_val, 1, false, MOTOR_I2C_INIT_TIMEOUT_US);
+        motor_driver_present = (ret == 1);
+        regs[ADDR_MOTOR_WHO_AM_I] = probe_val;
+    } else {
+        motor_driver_present = false;
+    }
+    regs[ADDR_MOTOR_I2C_STATUS] = motor_driver_present ? 0u : 1u;
+
+    // If recovered, send emergency stop to ensure motors are halted
+    if (motor_driver_present) {
+        uint8_t stop_cmd[2] = { MOTOR_REG_STOP, 0x01u };
+        i2c_write_timeout_us(MOTOR_I2C_PORT, MOTOR_I2C_ADDR, stop_cmd, 2, false, MOTOR_I2C_INIT_TIMEOUT_US);
+    }
+
+    // Reset the error snapshot so we measure new errors from here
+    motor_i2c_err_snapshot = (uint32_t)r_i32(ADDR_MOTOR_I2C_ERR_CNT);
+}
 
 static void init_motors(void) {
     // Initialise I2C1 on Grove 2 (GP2=SDA, GP3=SCL) for the Waveshare motor driver.
@@ -1446,6 +1535,11 @@ static void set_motor(uint8_t i2c_reg, bool reversed, float throttle, int motor_
         // Track failed writes — helps diagnose I2C wiring/power issues at runtime.
         uint32_t ec = (uint32_t)r_i32(ADDR_MOTOR_I2C_ERR_CNT);
         w_i32(ADDR_MOTOR_I2C_ERR_CNT, (int32_t)(ec + 1u));
+
+        // If errors are accumulating rapidly, attempt bus recovery.
+        if ((ec + 1u - motor_i2c_err_snapshot) >= MOTOR_I2C_ERR_RECOVERY_THRESHOLD) {
+            attempt_motor_i2c_recovery();
+        }
     }
 }
 
@@ -3149,6 +3243,7 @@ int main(void) {
 
     // Init motors AFTER USB is up so I2C probe timeouts don't stall enumeration.
     init_motors();
+    motor_i2c_err_snapshot = 0;
 
     // Init PIO quadrature encoders.  PIO has its own IRQ line (PIO0_IRQ_0),
     // independent of GPIO Bank0 IRQs, so order relative to board_init() is

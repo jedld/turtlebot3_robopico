@@ -16,7 +16,7 @@
 # Current hardware:
 #   Motor  : Cytron TT Motor Dual Metal Shaft 1:48, 3–6 V DC
 #            https://www.cytron.io/p-tt-motor-dual-metal-shaft
-#   Wheel  : Cytron Small Robot Rubber Wheel 65×26.5 mm (68.1 mm OD with tyre)
+#   Wheel  : Cytron Small Robot Rubber Wheel 65×26.5 mm (68 mm OD with tyre)
 #            https://www.cytron.io/p-small-robot-rubber-wheel-65x26.5mm
 #   Chassis: Custom
 #   Measured geometry (Mar 2026):
@@ -41,8 +41,8 @@ turtlebot3_node:
       protocol_version: 2.0
 
     wheels:
-      separation: 0.048585      # metres — calibrated effective turning base
-      radius: 0.03405           # metres — calibrated wheel radius; keep in sync with firmware/main.c
+      separation: 0.146500      # metres — physical track width 146.5 mm; recalibrate with auto_calibrate_imu_turn.py
+      radius: 0.034000          # metres — 68 mm diameter / 2; keep in sync with firmware/main.c
 
     motors:
       profile_acceleration_constant: 214.577
