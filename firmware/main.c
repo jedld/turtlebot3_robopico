@@ -134,7 +134,7 @@
 //   turtlebot3_bringup/param/humble/burger.yaml
 // ============================================================
 
-#define WHEEL_RADIUS_DEFAULT        0.034000f  // 68 mm diameter / 2 — recalibrate with calibrate_distance.py
+#define WHEEL_RADIUS_DEFAULT        0.032909f  // calibrated 2026-03-23
 // ANGULAR CALIBRATION: do NOT use a scale factor (it breaks odometry).
 // Tune WHEEL_SEPARATION to match effective turning base; run auto_calibrate_imu_turn.py.
 #define WHEEL_SEPARATION_DEFAULT    0.146500f  // metres — physical track width 146.5 mm; recalibrate with auto_calibrate_imu_turn.py
@@ -226,7 +226,7 @@
 // gyro smooths inter-sample noise only.  With BNO055 vibration-rectification
 // bias of 3–6 °/s, lower α is essential to keep the biased gyro from dominating.
 // Raise toward 0.8–0.9 only with a clean gyro (e.g. BNO085 with vibration isolation).
-#define IMU_HEADING_COMP_ALPHA_DEFAULT  0.30f  // complementary filter weight (0=encoder only, 1=gyro only)
+#define IMU_HEADING_COMP_ALPHA_DEFAULT  0.0f  // complementary filter weight (0=encoder only, 1=gyro only)
 // Online gyro bias estimator — learns the vibration-rectification DC offset
 // that BNO055 MEMS gyros exhibit under motor vibration (~3-6 °/s).
 // β controls how fast the bias tracks.  At 50 Hz, β=0.02 gives a time
@@ -258,14 +258,23 @@
 //   v_left  += trim / 2
 //   v_right -= trim / 2
 // Positive = correct left drift (speed up left, slow right).
-#define VEL_TRIM_FWD_DEFAULT          0.0f  // calibrated 2026-03-15: drift_calib, trim=-0.003851
+#define VEL_TRIM_FWD_DEFAULT          0.014000f  // 2026-03-28: 0.015 overcorrected (rightward drift); split difference
 #define VEL_TRIM_REV_DEFAULT         -0.002300f  // calibrated 2026-03-13: diagnose_reverse.py auto-tune
 // Preload the heading-hold integrator with the equivalent angular correction
 // implied by the learned velocity trim. This removes the multi-degree startup
 // transient that otherwise occurs while the P controller waits for encoder
 // heading error to build up enough to generate the same correction.
-#define HEADING_HOLD_I_SEED_FWD_DEFAULT   0.117385f  // angular-equivalent of forward trim
+#define HEADING_HOLD_I_SEED_FWD_DEFAULT   0.090000f  // tuned 2026-03-28 from runtime sweep: trims forward startup left drift while leaving reverse unchanged
 #define HEADING_HOLD_I_SEED_REV_DEFAULT   0.007800f  // calibrated 2026-03-13: diagnose_reverse.py auto-tune
+// Startup assist — short-lived extra per-wheel velocity trim that only acts
+// while one wheel has already produced encoder motion and the other has not.
+// This targets launch skew from gearbox backlash, static friction, and motor
+// dead-zone asymmetry before the normal encoder heading loop has enough error
+// history to respond. Applied symmetrically so the average forward speed stays
+// nearly unchanged.
+#define STARTUP_ASSIST_TIMEOUT_S      0.25f   // limit assist to the first 250 ms of a straight segment
+#define STARTUP_ASSIST_MOVE_COUNTS    6       // counts required to declare a wheel "engaged"
+#define STARTUP_ASSIST_BOOST_MS       0.012f  // per-wheel boost magnitude (m/s)
 // Velocity slew-rate (ramp) limiter — applied to the PID setpoint each 50 Hz cycle.
 // Limits the rate of change of the commanded wheel velocity to prevent wheel slip
 // and match TurtleBot3 OpenCR trapezoidal velocity profile behaviour.
@@ -565,7 +574,7 @@ static inline void w_f32(uint addr, float v) {
 // Debug — IMU init diagnostics (read-only, addresses 174–183)
 // These are written once at boot and remain constant; read via Dynamixel or
 // the debug_bno085.py script when bringup is NOT running.
-#define ADDR_DBG_IMU_SOURCE     174u  // 1 byte: 0=simulated 1=BNO085 2=BNO055
+#define ADDR_DBG_IMU_SOURCE     174u  // 1 byte: 0=simulated 1=BNO08X 2=BNO055
 #define ADDR_DBG_BNO085_RC      175u  // 1 byte: BNO085 init result
                                       //   0 = init succeeded (BNO085 active)
                                       //   1 = SHTP timeout at 0x4A (no reply in 500 ms)
@@ -733,10 +742,11 @@ static void init_registers(void) {
     w_f32(ADDR_VEL_TRIM_FWD, VEL_TRIM_FWD_DEFAULT);
     w_f32(ADDR_VEL_TRIM_REV, VEL_TRIM_REV_DEFAULT);
 
-    // IMU-encoder complementary filter — enabled by default; weight α=0.98.
-    // When no hardware IMU is present, fusion is auto-disabled regardless of this flag.
+    // IMU-encoder complementary filter — enabled by default for BNO085; α uses
+    // IMU_HEADING_COMP_ALPHA_DEFAULT. When no hardware IMU is present, fusion is
+    // auto-disabled regardless of this flag.
     w_f32(ADDR_IMU_HEADING_ALPHA, IMU_HEADING_COMP_ALPHA_DEFAULT);
-    regs[ADDR_IMU_HEADING_EN] = 0u;  // enabled by default
+    regs[ADDR_IMU_HEADING_EN] = 1u;  // enabled by default
     w_f32(ADDR_DBG_HEADING_FUSED, 0.0f);
     w_f32(ADDR_DBG_HEADING_GYRO, 0.0f);
     w_f32(ADDR_DBG_HEADING_ENC, 0.0f);
@@ -1815,17 +1825,17 @@ static void init_encoders(void) {
 // IMU type selection
 // ============================================================
 // Controlled by the IMU_TYPE compile-time flag (cmake -DIMU_TYPE=n):
-//   0 = AUTO      probe BNO085 first; fall back to BNO055; then simulated
-//   1 = BNO085    probe BNO085 only  (skip BNO055 init entirely)
-//   2 = BNO055    probe BNO055 only  (skip the long BNO085 SHTP drain, default)
+//   0 = AUTO      probe BNO08X first; fall back to BNO055; then simulated
+//   1 = BNO08X    probe BNO08X (BNO085/BNO086/BNO080) via SHTP only
+//   2 = BNO055    probe BNO055 only  (skip the long BNO08X SHTP drain)
 //   3 = SIMULATED no hardware IMU;   always use static simulated data
-// If the flag is not provided by the build system, BNO055-only is assumed.
+// If the flag is not provided by the build system, BNO08X-only is assumed.
 #ifndef IMU_TYPE
-#  define IMU_TYPE 2   /* 2=BNO055 */
+#  define IMU_TYPE 1   /* 1=BNO08X */
 #endif
 
 // ============================================================
-// BNO085 IMU  (SHTP over I2C on Grove 1 port)
+// BNO08X IMU  (SHTP over I2C on Grove 1 port — BNO080/BNO085/BNO086)
 // ============================================================
 //
 // Grove 1 connector on the Cytron Robo Pico:
@@ -1878,6 +1888,51 @@ static void init_encoders(void) {
 #define Q8_SCALE   (1.0f / 256.0f)
 #define Q9_SCALE   (1.0f / 512.0f)
 #define Q4_UT_TO_T (1.0f / 16.0f * 1e-6f)   // µT → T (ROS uses SI Tesla)
+
+// IMU mount compensation.
+// Physical BNO08X/BNO055 board is mounted upright but yaw-rotated such that:
+//   sensor +X points toward the robot's right wheel
+//   sensor +Y points toward the robot's front
+// To publish REP-103 robot-frame data (x=forward, y=left, z=up), rotate all
+// sensor vectors -90° about +Z:
+//   robot_x =  sensor_y
+//   robot_y = -sensor_x
+//   robot_z =  sensor_z
+// For orientation quaternions, apply the inverse fixed mount rotation on the
+// right so the reported attitude matches the robot body frame.
+#define IMU_MOUNT_QZ_POS_90  (0.7071067811865475f)
+#define IMU_MOUNT_QW_POS_90  (0.7071067811865475f)
+
+static inline void imu_mount_remap_vector(float sx, float sy, float sz,
+                                          float *rx, float *ry, float *rz) {
+    *rx =  sy;
+    *ry = -sx;
+    *rz =  sz;
+}
+
+static inline void imu_mount_remap_quaternion(float sx, float sy, float sz, float sw,
+                                              float *rx, float *ry, float *rz, float *rw) {
+    // q_robot = q_sensor * q_mount_inverse, where q_mount_inverse is a +90°
+    // yaw rotation about +Z.
+    float ox = sx * IMU_MOUNT_QW_POS_90 + sy * IMU_MOUNT_QZ_POS_90;
+    float oy = -sx * IMU_MOUNT_QZ_POS_90 + sy * IMU_MOUNT_QW_POS_90;
+    float oz = sw * IMU_MOUNT_QZ_POS_90 + sz * IMU_MOUNT_QW_POS_90;
+    float ow = sw * IMU_MOUNT_QW_POS_90 - sz * IMU_MOUNT_QZ_POS_90;
+
+    float norm = sqrtf(ox * ox + oy * oy + oz * oz + ow * ow);
+    if (norm > 1e-6f) {
+        float inv_norm = 1.0f / norm;
+        ox *= inv_norm;
+        oy *= inv_norm;
+        oz *= inv_norm;
+        ow *= inv_norm;
+    }
+
+    *rx = ox;
+    *ry = oy;
+    *rz = oz;
+    *rw = ow;
+}
 
 // Probe result — set by init_bno085(); read by update_sensors()
 static bool bno085_present = false;
@@ -1996,10 +2051,14 @@ static void bno085_parse_cargo(const uint8_t *cargo, uint16_t len) {
             int16_t qj = (int16_t)((uint16_t)cargo[off+ 6] | ((uint16_t)cargo[off+ 7] << 8u));
             int16_t qk = (int16_t)((uint16_t)cargo[off+ 8] | ((uint16_t)cargo[off+ 9] << 8u));
             int16_t qr = (int16_t)((uint16_t)cargo[off+10] | ((uint16_t)cargo[off+11] << 8u));
-            w_f32(ADDR_IMU_ORIENT_X, qi * Q14_SCALE);
-            w_f32(ADDR_IMU_ORIENT_Y, qj * Q14_SCALE);
-            w_f32(ADDR_IMU_ORIENT_Z, qk * Q14_SCALE);
-            w_f32(ADDR_IMU_ORIENT_W, qr * Q14_SCALE);
+            float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;
+            imu_mount_remap_quaternion(qi * Q14_SCALE, qj * Q14_SCALE,
+                                       qk * Q14_SCALE, qr * Q14_SCALE,
+                                       &qx, &qy, &qz, &qw);
+            w_f32(ADDR_IMU_ORIENT_X, qx);
+            w_f32(ADDR_IMU_ORIENT_Y, qy);
+            w_f32(ADDR_IMU_ORIENT_Z, qz);
+            w_f32(ADDR_IMU_ORIENT_W, qw);
             off += 14u;
         }
         else if (rid == SH2_ACCELEROMETER) {
@@ -2008,9 +2067,12 @@ static void bno085_parse_cargo(const uint8_t *cargo, uint16_t len) {
             int16_t ax = (int16_t)((uint16_t)cargo[off+4] | ((uint16_t)cargo[off+5] << 8u));
             int16_t ay = (int16_t)((uint16_t)cargo[off+6] | ((uint16_t)cargo[off+7] << 8u));
             int16_t az = (int16_t)((uint16_t)cargo[off+8] | ((uint16_t)cargo[off+9] << 8u));
-            w_f32(ADDR_IMU_LIN_ACC_X, ax * Q8_SCALE);
-            w_f32(ADDR_IMU_LIN_ACC_Y, ay * Q8_SCALE);
-            w_f32(ADDR_IMU_LIN_ACC_Z, az * Q8_SCALE);
+            float rx = 0.0f, ry = 0.0f, rz = 0.0f;
+            imu_mount_remap_vector(ax * Q8_SCALE, ay * Q8_SCALE, az * Q8_SCALE,
+                                   &rx, &ry, &rz);
+            w_f32(ADDR_IMU_LIN_ACC_X, rx);
+            w_f32(ADDR_IMU_LIN_ACC_Y, ry);
+            w_f32(ADDR_IMU_LIN_ACC_Z, rz);
             off += 10u;
         }
         else if (rid == SH2_GYROSCOPE_CAL) {
@@ -2019,9 +2081,12 @@ static void bno085_parse_cargo(const uint8_t *cargo, uint16_t len) {
             int16_t gx = (int16_t)((uint16_t)cargo[off+4] | ((uint16_t)cargo[off+5] << 8u));
             int16_t gy = (int16_t)((uint16_t)cargo[off+6] | ((uint16_t)cargo[off+7] << 8u));
             int16_t gz = (int16_t)((uint16_t)cargo[off+8] | ((uint16_t)cargo[off+9] << 8u));
-            w_f32(ADDR_IMU_ANG_VEL_X, gx * Q9_SCALE);
-            w_f32(ADDR_IMU_ANG_VEL_Y, gy * Q9_SCALE);
-            w_f32(ADDR_IMU_ANG_VEL_Z, gz * Q9_SCALE);
+            float rx = 0.0f, ry = 0.0f, rz = 0.0f;
+            imu_mount_remap_vector(gx * Q9_SCALE, gy * Q9_SCALE, gz * Q9_SCALE,
+                                   &rx, &ry, &rz);
+            w_f32(ADDR_IMU_ANG_VEL_X, rx);
+            w_f32(ADDR_IMU_ANG_VEL_Y, ry);
+            w_f32(ADDR_IMU_ANG_VEL_Z, rz);
             off += 10u;
         }
         else if (rid == SH2_MAG_FIELD_CAL) {
@@ -2031,9 +2096,12 @@ static void bno085_parse_cargo(const uint8_t *cargo, uint16_t len) {
             int16_t mx = (int16_t)((uint16_t)cargo[off+4] | ((uint16_t)cargo[off+5] << 8u));
             int16_t my = (int16_t)((uint16_t)cargo[off+6] | ((uint16_t)cargo[off+7] << 8u));
             int16_t mz = (int16_t)((uint16_t)cargo[off+8] | ((uint16_t)cargo[off+9] << 8u));
-            w_f32(ADDR_IMU_MAG_X, mx * Q4_UT_TO_T);
-            w_f32(ADDR_IMU_MAG_Y, my * Q4_UT_TO_T);
-            w_f32(ADDR_IMU_MAG_Z, mz * Q4_UT_TO_T);
+            float rx = 0.0f, ry = 0.0f, rz = 0.0f;
+            imu_mount_remap_vector(mx * Q4_UT_TO_T, my * Q4_UT_TO_T, mz * Q4_UT_TO_T,
+                                   &rx, &ry, &rz);
+            w_f32(ADDR_IMU_MAG_X, rx);
+            w_f32(ADDR_IMU_MAG_Y, ry);
+            w_f32(ADDR_IMU_MAG_Z, rz);
             off += 10u;
         }
         else if (rid == 0xFBu) {
@@ -2502,9 +2570,12 @@ static void bno055_update(void) {
         int16_t ax = (int16_t)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8u));
         int16_t ay = (int16_t)((uint16_t)buf[2] | ((uint16_t)buf[3] << 8u));
         int16_t az = (int16_t)((uint16_t)buf[4] | ((uint16_t)buf[5] << 8u));
-        w_f32(ADDR_IMU_LIN_ACC_X, ax * BNO055_ACCEL_SCALE);
-        w_f32(ADDR_IMU_LIN_ACC_Y, ay * BNO055_ACCEL_SCALE);
-        w_f32(ADDR_IMU_LIN_ACC_Z, az * BNO055_ACCEL_SCALE);
+        float rx = 0.0f, ry = 0.0f, rz = 0.0f;
+        imu_mount_remap_vector(ax * BNO055_ACCEL_SCALE, ay * BNO055_ACCEL_SCALE,
+                               az * BNO055_ACCEL_SCALE, &rx, &ry, &rz);
+        w_f32(ADDR_IMU_LIN_ACC_X, rx);
+        w_f32(ADDR_IMU_LIN_ACC_Y, ry);
+        w_f32(ADDR_IMU_LIN_ACC_Z, rz);
     }
 
     // Gyroscope X Y Z — 0x14–0x19  (int16, (π/180)/16 rad/s per LSB in dps mode)
@@ -2515,9 +2586,11 @@ static void bno055_update(void) {
         float gx_rad = gx * BNO055_GYRO_SCALE;
         float gy_rad = gy * BNO055_GYRO_SCALE;
         float gz_rad = gz * BNO055_GYRO_SCALE;
-        w_f32(ADDR_IMU_ANG_VEL_X, gx_rad);
-        w_f32(ADDR_IMU_ANG_VEL_Y, gy_rad);
-        w_f32(ADDR_IMU_ANG_VEL_Z, gz_rad);
+        float rx = 0.0f, ry = 0.0f, rz = 0.0f;
+        imu_mount_remap_vector(gx_rad, gy_rad, gz_rad, &rx, &ry, &rz);
+        w_f32(ADDR_IMU_ANG_VEL_X, rx);
+        w_f32(ADDR_IMU_ANG_VEL_Y, ry);
+        w_f32(ADDR_IMU_ANG_VEL_Z, rz);
     }
 
     // Fused quaternion W X Y Z — 0x20–0x27 (int16 Q14)
@@ -2528,10 +2601,14 @@ static void bno055_update(void) {
         int16_t qx = (int16_t)((uint16_t)buf[2] | ((uint16_t)buf[3] << 8u));
         int16_t qy = (int16_t)((uint16_t)buf[4] | ((uint16_t)buf[5] << 8u));
         int16_t qz = (int16_t)((uint16_t)buf[6] | ((uint16_t)buf[7] << 8u));
-        w_f32(ADDR_IMU_ORIENT_W, qw * BNO055_Q14_SCALE);
-        w_f32(ADDR_IMU_ORIENT_X, qx * BNO055_Q14_SCALE);
-        w_f32(ADDR_IMU_ORIENT_Y, qy * BNO055_Q14_SCALE);
-        w_f32(ADDR_IMU_ORIENT_Z, qz * BNO055_Q14_SCALE);
+        float rx = 0.0f, ry = 0.0f, rz = 0.0f, rw = 1.0f;
+        imu_mount_remap_quaternion(qx * BNO055_Q14_SCALE, qy * BNO055_Q14_SCALE,
+                                   qz * BNO055_Q14_SCALE, qw * BNO055_Q14_SCALE,
+                                   &rx, &ry, &rz, &rw);
+        w_f32(ADDR_IMU_ORIENT_W, rw);
+        w_f32(ADDR_IMU_ORIENT_X, rx);
+        w_f32(ADDR_IMU_ORIENT_Y, ry);
+        w_f32(ADDR_IMU_ORIENT_Z, rz);
     }
 
     // Magnetometer X Y Z — 0x0E–0x13  (int16, 0.0625 µT per LSB → Tesla)
@@ -2539,9 +2616,12 @@ static void bno055_update(void) {
         int16_t mx = (int16_t)((uint16_t)buf[0] | ((uint16_t)buf[1] << 8u));
         int16_t my = (int16_t)((uint16_t)buf[2] | ((uint16_t)buf[3] << 8u));
         int16_t mz = (int16_t)((uint16_t)buf[4] | ((uint16_t)buf[5] << 8u));
-        w_f32(ADDR_IMU_MAG_X, mx * BNO055_MAG_UT_TO_T);
-        w_f32(ADDR_IMU_MAG_Y, my * BNO055_MAG_UT_TO_T);
-        w_f32(ADDR_IMU_MAG_Z, mz * BNO055_MAG_UT_TO_T);
+        float rx = 0.0f, ry = 0.0f, rz = 0.0f;
+        imu_mount_remap_vector(mx * BNO055_MAG_UT_TO_T, my * BNO055_MAG_UT_TO_T,
+                               mz * BNO055_MAG_UT_TO_T, &rx, &ry, &rz);
+        w_f32(ADDR_IMU_MAG_X, rx);
+        w_f32(ADDR_IMU_MAG_Y, ry);
+        w_f32(ADDR_IMU_MAG_Z, rz);
     }
 
     // Calibration status — CALIB_STAT (0x35).
@@ -2584,6 +2664,9 @@ static bool    heading_hold_active = false;
 static float   heading_hold_iterm  = 0.0f;  // integral accumulator
 static float   heading_hold_prev_err = 0.0f; // previous heading error (for derivative)
 static float   heading_hold_d_filt   = 0.0f; // low-pass filtered derivative
+static float   startup_assist_elapsed = 0.0f; // time since current straight segment began
+static int32_t startup_counts_l = 0;          // abs encoder counts since segment start
+static int32_t startup_counts_r = 0;
 
 // Encoder differential trim state — accumulated (L−R) distance during straight driving.
 static float   enc_straight_diff   = 0.0f;  // metres
@@ -2644,6 +2727,9 @@ static void update_odometry(float dt) {
             heading_fused       = 0.0f;   // reset complementary filter state
             heading_gyro_accum  = 0.0f;   // reset gyro accumulator
             gyro_bias_est       = 0.0f;   // reset bias — it flips sign with direction
+            startup_assist_elapsed = 0.0f;
+            startup_counts_l = 0;
+            startup_counts_r = 0;
             heading_hold_active = true;
         }
 
@@ -2818,6 +2904,7 @@ static void update_odometry(float dt) {
     // Differential-drive: target wheel speeds in m/s.
     float v_left  = lin_x - ang_z * (cfg_wheel_separation / 2.0f);
     float v_right = lin_x + ang_z * (cfg_wheel_separation / 2.0f);
+    float total_trim = 0.0f;
 
     // ── Velocity-level feedforward trim ───────────────────────────────────
     // Directly compensates known motor asymmetry learned by the auto-tuner.
@@ -2828,10 +2915,37 @@ static void update_odometry(float dt) {
                                             : r_f32(ADDR_VEL_TRIM_FWD);
         v_left  += vel_trim * 0.5f;
         v_right -= vel_trim * 0.5f;
-        w_f32(ADDR_DBG_ENC_TRIM, vel_trim);
+        total_trim = vel_trim;
+
+        // Startup assist — if one wheel has already engaged and the other is
+        // still within backlash / stiction take-up, bias the lagging wheel for
+        // a brief window so the robot doesn't yaw before encoder heading hold
+        // has enough differential motion to react.
+        startup_assist_elapsed += safe_dt;
+        if (startup_assist_elapsed <= STARTUP_ASSIST_TIMEOUT_S) {
+            bool left_engaged  = startup_counts_l >= STARTUP_ASSIST_MOVE_COUNTS;
+            bool right_engaged = startup_counts_r >= STARTUP_ASSIST_MOVE_COUNTS;
+            if (left_engaged != right_engaged) {
+                float startup_trim = ((lin_x >= 0.0f) ? 1.0f : -1.0f) * STARTUP_ASSIST_BOOST_MS;
+                if (!left_engaged) {
+                    v_left  += startup_trim;
+                    v_right -= startup_trim;
+                    total_trim += 2.0f * startup_trim;
+                } else {
+                    v_left  -= startup_trim;
+                    v_right += startup_trim;
+                    total_trim -= 2.0f * startup_trim;
+                }
+            }
+        }
+
+        w_f32(ADDR_DBG_ENC_TRIM, total_trim);
         w_f32(ADDR_DBG_ENC_DIFF, enc_straight_diff);
     } else {
         enc_straight_diff = 0.0f;
+        startup_assist_elapsed = 0.0f;
+        startup_counts_l = 0;
+        startup_counts_r = 0;
         w_f32(ADDR_DBG_ENC_TRIM, 0.0f);
         w_f32(ADDR_DBG_ENC_DIFF, 0.0f);
     }
@@ -2904,6 +3018,8 @@ static void update_odometry(float dt) {
         float dl_m = signed_dl * ENC_RAD_PER_COUNT * cfg_wheel_radius;
         float dr_m = signed_dr * ENC_RAD_PER_COUNT * cfg_wheel_radius;
         enc_straight_diff += (dl_m - dr_m);
+        startup_counts_l += (delta_enc_l >= 0) ? delta_enc_l : -delta_enc_l;
+        startup_counts_r += (delta_enc_r >= 0) ? delta_enc_r : -delta_enc_r;
     }
 
     // ── Incremental velocity PID (one per wheel) ────────────────────────────

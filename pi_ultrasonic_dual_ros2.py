@@ -16,33 +16,36 @@ import time
 
 
 def read_distance_mm(gpio_mod, gpio: int, timeout_us: int = 30000):
-    gpio_mod.setup(gpio, gpio_mod.OUT, initial=gpio_mod.LOW)
-    time.sleep(2e-6)
-    gpio_mod.output(gpio, gpio_mod.HIGH)
-    time.sleep(10e-6)
-    gpio_mod.output(gpio, gpio_mod.LOW)
+    try:
+        gpio_mod.setup(gpio, gpio_mod.OUT, initial=gpio_mod.LOW)
+        time.sleep(2e-6)
+        gpio_mod.output(gpio, gpio_mod.HIGH)
+        time.sleep(10e-6)
+        gpio_mod.output(gpio, gpio_mod.LOW)
 
-    gpio_mod.setup(gpio, gpio_mod.IN)
+        gpio_mod.setup(gpio, gpio_mod.IN)
 
-    start_ns = time.perf_counter_ns()
-    timeout_ns = int(timeout_us * 1000)
-    while gpio_mod.input(gpio) == 0:
-        if (time.perf_counter_ns() - start_ns) > timeout_ns:
-            return None, "wait-timeout"
+        start_ns = time.perf_counter_ns()
+        timeout_ns = int(timeout_us * 1000)
+        while gpio_mod.input(gpio) == 0:
+            if (time.perf_counter_ns() - start_ns) > timeout_ns:
+                return None, "wait-timeout"
 
-    rise_ns = time.perf_counter_ns()
-    while gpio_mod.input(gpio) == 1:
-        if (time.perf_counter_ns() - rise_ns) > timeout_ns:
-            return None, "pulse-timeout"
+        rise_ns = time.perf_counter_ns()
+        while gpio_mod.input(gpio) == 1:
+            if (time.perf_counter_ns() - rise_ns) > timeout_ns:
+                return None, "pulse-timeout"
 
-    fall_ns = time.perf_counter_ns()
-    pulse_us = (fall_ns - rise_ns) / 1000.0
+        fall_ns = time.perf_counter_ns()
+        pulse_us = (fall_ns - rise_ns) / 1000.0
 
-    distance_mm = (pulse_us * 10.0) / 58.0
-    if distance_mm < 20.0 or distance_mm > 3500.0:
-        return None, "out-of-range"
+        distance_mm = (pulse_us * 10.0) / 58.0
+        if distance_mm < 20.0 or distance_mm > 3500.0:
+            return None, "out-of-range"
 
-    return distance_mm, None
+        return distance_mm, None
+    except Exception as exc:
+        return None, f"gpio-error: {exc}"
 
 
 def main():
@@ -71,6 +74,7 @@ def main():
 
     try:
         import rclpy
+        from rclpy.executors import ExternalShutdownException
         from rclpy.node import Node
         from sensor_msgs.msg import Range
     except Exception:
@@ -88,6 +92,8 @@ def main():
             self.pub_right = self.create_publisher(Range, args.right_topic, 10)
             self.period = max(0.02, 1.0 / max(0.1, args.rate))
             self.timer = self.create_timer(self.period, self.tick)
+            self._shutting_down = False
+            self._last_tick_error = None
 
             self.min_range = 0.02
             self.max_range = 3.50
@@ -98,7 +104,14 @@ def main():
                 f"right GPIO{args.right_gpio}->{args.right_topic} at {1.0/self.period:.1f} Hz"
             )
 
+        def stop(self):
+            self._shutting_down = True
+            self.timer.cancel()
+
         def publish_one(self, pub, frame_id, dist_mm):
+            if self._shutting_down or not rclpy.ok():
+                return
+
             msg = Range()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.header.frame_id = frame_id
@@ -112,15 +125,30 @@ def main():
             else:
                 msg.range = float(dist_mm / 1000.0)
 
-            pub.publish(msg)
+            try:
+                pub.publish(msg)
+            except Exception:
+                self._shutting_down = True
 
         def tick(self):
+            if self._shutting_down or not rclpy.ok():
+                return
+
             left_mm, left_err = read_distance_mm(GPIO, args.left_gpio, args.timeout_us)
             time.sleep(max(0.0, args.inter_sensor_gap))
             right_mm, right_err = read_distance_mm(GPIO, args.right_gpio, args.timeout_us)
 
-            self.publish_one(self.pub_left, args.left_frame, left_mm)
-            self.publish_one(self.pub_right, args.right_frame, right_mm)
+            try:
+                self.publish_one(self.pub_left, args.left_frame, left_mm)
+                self.publish_one(self.pub_right, args.right_frame, right_mm)
+            except Exception as exc:
+                err_text = str(exc)
+                if err_text != self._last_tick_error:
+                    self.get_logger().warning(f"ultrasonic publish tick failed: {err_text}")
+                    self._last_tick_error = err_text
+                return
+
+            self._last_tick_error = None
 
             if left_err or right_err:
                 self.get_logger().debug(
@@ -132,13 +160,18 @@ def main():
     node = UltrasonicNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        node.stop()
         node.destroy_node()
-        rclpy.shutdown()
-        GPIO.cleanup(args.left_gpio)
-        GPIO.cleanup(args.right_gpio)
+        if rclpy.ok():
+            rclpy.shutdown()
+        try:
+            GPIO.cleanup(args.left_gpio)
+            GPIO.cleanup(args.right_gpio)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

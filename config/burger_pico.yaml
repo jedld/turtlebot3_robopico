@@ -42,7 +42,7 @@ turtlebot3_node:
 
     wheels:
       separation: 0.146500      # metres — physical track width 146.5 mm; recalibrate with auto_calibrate_imu_turn.py
-      radius: 0.034000          # metres — 68 mm diameter / 2; keep in sync with firmware/main.c
+      radius: 0.032909          # metres — calibrated 2026-03-23; keep in sync with firmware/main.c
 
     motors:
       profile_acceleration_constant: 214.577
