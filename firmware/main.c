@@ -134,10 +134,10 @@
 //   turtlebot3_bringup/param/humble/burger.yaml
 // ============================================================
 
-#define WHEEL_RADIUS_DEFAULT        0.032909f  // calibrated 2026-03-23
+#define WHEEL_RADIUS_DEFAULT        0.037009f  // calibrated 2026-03-23
 // ANGULAR CALIBRATION: do NOT use a scale factor (it breaks odometry).
 // Tune WHEEL_SEPARATION to match effective turning base; run auto_calibrate_imu_turn.py.
-#define WHEEL_SEPARATION_DEFAULT    0.146500f  // metres — physical track width 146.5 mm; recalibrate with auto_calibrate_imu_turn.py
+#define WHEEL_SEPARATION_DEFAULT    0.185000f  // metres — physical track width 146.5 mm; recalibrate with auto_calibrate_imu_turn.py
 #define MAX_WHEEL_SPEED_MS_DEFAULT  0.067899f  // calibrated 2026-03-18: USS ground truth, correction=0.9165 (-8.3%)
 #define LEFT_MOTOR_REVERSED_DEFAULT  1       // left motor also needs inverted polarity (M1=left)
 #define RIGHT_MOTOR_REVERSED_DEFAULT 1       // right motor needs inverted polarity (M2=right)
@@ -149,6 +149,11 @@
 // Set to 0.0f to disable.  Range: 0.0 – 1.0.
 #define MOTOR_MIN_DUTY_LEFT_DEFAULT   0.05f  // calibrated — calibrate_deadzone.py (12V)
 #define MOTOR_MIN_DUTY_RIGHT_DEFAULT  0.05f  // calibrated — calibrate_deadzone.py (12V)
+// Forward-only dead-zone adjustment. This compensates low-speed forward bias
+// without perturbing reverse, which is already close to symmetric.
+// Applied on top of the per-motor base min duty and clamped to [0, 1].
+#define MOTOR_MIN_DUTY_FWD_ADJ_LEFT_DEFAULT   0.003f  // tuned 2026-04-02: improves low-speed forward floor tracking
+#define MOTOR_MIN_DUTY_FWD_ADJ_RIGHT_DEFAULT  0.0f
 
 // Kick-start: when a motor transitions from stopped to moving (or reverses
 // direction), apply KICK_DUTY for KICK_CYCLES odometry cycles to overcome
@@ -259,7 +264,7 @@
 //   v_right -= trim / 2
 // Positive = correct left drift (speed up left, slow right).
 #define VEL_TRIM_FWD_DEFAULT          0.014000f  // 2026-03-28: 0.015 overcorrected (rightward drift); split difference
-#define VEL_TRIM_REV_DEFAULT         -0.002300f  // calibrated 2026-03-13: diagnose_reverse.py auto-tune
+#define VEL_TRIM_REV_DEFAULT          0.000000f  // 2026-04-02: ground validation showed the old negative trim worsened reverse symmetry
 // Preload the heading-hold integrator with the equivalent angular correction
 // implied by the learned velocity trim. This removes the multi-degree startup
 // transient that otherwise occurs while the P controller waits for encoder
@@ -305,6 +310,8 @@ static uint8_t cfg_right_motor_reversed = RIGHT_MOTOR_REVERSED_DEFAULT;
 static uint8_t cfg_swap_left_right_motors = SWAP_LEFT_RIGHT_MOTORS_DEFAULT;
 static float cfg_motor_min_duty_left = MOTOR_MIN_DUTY_LEFT_DEFAULT;
 static float cfg_motor_min_duty_right = MOTOR_MIN_DUTY_RIGHT_DEFAULT;
+static float cfg_motor_min_duty_fwd_adj_left = MOTOR_MIN_DUTY_FWD_ADJ_LEFT_DEFAULT;
+static float cfg_motor_min_duty_fwd_adj_right = MOTOR_MIN_DUTY_FWD_ADJ_RIGHT_DEFAULT;
 static float cfg_motor_kick_duty = MOTOR_KICK_DUTY_DEFAULT;
 static uint8_t cfg_motor_kick_cycles = MOTOR_KICK_CYCLES_DEFAULT;
 static float cfg_motor_trim_left = MOTOR_TRIM_LEFT_DEFAULT;
@@ -323,7 +330,7 @@ static inline float rpm_per_ms(void) {
 }
 
 #define CALIB_FLASH_MAGIC   0x43414C31u  // "CAL1"
-#define CALIB_FLASH_VERSION 12u // bumped: invalidate pre-drift-fix blobs that restore stale motion calibration at boot
+#define CALIB_FLASH_VERSION 13u // bumped: add forward-only min-duty calibration fields
 #define CALIB_FLASH_OFFSET  (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
 
 typedef struct {
@@ -335,6 +342,8 @@ typedef struct {
     float max_wheel_speed_ms;
     float motor_min_duty_left;
     float motor_min_duty_right;
+    float motor_min_duty_fwd_adj_left;
+    float motor_min_duty_fwd_adj_right;
     float motor_kick_duty;
     uint8_t motor_kick_cycles;
     uint8_t right_motor_reversed;
@@ -364,6 +373,8 @@ static void fill_calib_blob(calib_flash_t *blob) {
     blob->max_wheel_speed_ms = cfg_max_wheel_speed_ms;
     blob->motor_min_duty_left = cfg_motor_min_duty_left;
     blob->motor_min_duty_right = cfg_motor_min_duty_right;
+    blob->motor_min_duty_fwd_adj_left = cfg_motor_min_duty_fwd_adj_left;
+    blob->motor_min_duty_fwd_adj_right = cfg_motor_min_duty_fwd_adj_right;
     blob->motor_kick_duty = cfg_motor_kick_duty;
     blob->motor_kick_cycles = cfg_motor_kick_cycles;
     blob->right_motor_reversed = cfg_right_motor_reversed;
@@ -386,6 +397,8 @@ static bool is_calib_blob_valid(const calib_flash_t *blob) {
     if (blob->max_wheel_speed_ms < 0.01f || blob->max_wheel_speed_ms > 5.0f) return false;
     if (blob->motor_min_duty_left < 0.0f || blob->motor_min_duty_left > 1.0f) return false;
     if (blob->motor_min_duty_right < 0.0f || blob->motor_min_duty_right > 1.0f) return false;
+    if (blob->motor_min_duty_fwd_adj_left < -0.25f || blob->motor_min_duty_fwd_adj_left > 0.25f) return false;
+    if (blob->motor_min_duty_fwd_adj_right < -0.25f || blob->motor_min_duty_fwd_adj_right > 0.25f) return false;
     if (blob->motor_kick_duty < 0.0f || blob->motor_kick_duty > 1.0f) return false;
     if (blob->motor_kick_cycles > 20u) return false;
     if (blob->motor_trim_left < 0.5f || blob->motor_trim_left > 1.5f) return false;
@@ -399,6 +412,8 @@ static void apply_calib_blob(const calib_flash_t *blob) {
     cfg_max_wheel_speed_ms = blob->max_wheel_speed_ms;
     cfg_motor_min_duty_left = blob->motor_min_duty_left;
     cfg_motor_min_duty_right = blob->motor_min_duty_right;
+    cfg_motor_min_duty_fwd_adj_left = blob->motor_min_duty_fwd_adj_left;
+    cfg_motor_min_duty_fwd_adj_right = blob->motor_min_duty_fwd_adj_right;
     cfg_motor_kick_duty = blob->motor_kick_duty;
     cfg_motor_kick_cycles = blob->motor_kick_cycles;
     cfg_right_motor_reversed = blob->right_motor_reversed ? 1u : 0u;
@@ -916,6 +931,8 @@ static volatile uint64_t last_host_comm_us  = 0;
 #define CALIB_KEY_MOTOR_MIN_DUTY_LEFT  0x0Bu
 #define CALIB_KEY_MOTOR_MIN_DUTY_RIGHT 0x0Cu
 #define CALIB_KEY_LEFT_MOTOR_REVERSED  0x0Du
+#define CALIB_KEY_MOTOR_MIN_DUTY_FWD_ADJ_LEFT  0x0Eu
+#define CALIB_KEY_MOTOR_MIN_DUTY_FWD_ADJ_RIGHT 0x0Fu
 
 static void send_packet(uint32_t len);
 
@@ -956,6 +973,14 @@ static bool set_calibration_value(uint8_t key, float value) {
             if (value < 0.0f || value > 1.0f) return false;
             cfg_motor_min_duty_right = value;
             return true;
+        case CALIB_KEY_MOTOR_MIN_DUTY_FWD_ADJ_LEFT:
+            if (value < -0.25f || value > 0.25f) return false;
+            cfg_motor_min_duty_fwd_adj_left = value;
+            return true;
+        case CALIB_KEY_MOTOR_MIN_DUTY_FWD_ADJ_RIGHT:
+            if (value < -0.25f || value > 0.25f) return false;
+            cfg_motor_min_duty_fwd_adj_right = value;
+            return true;
         case CALIB_KEY_MOTOR_KICK_DUTY:
             if (value < 0.0f || value > 1.0f) return false;
             cfg_motor_kick_duty = value;
@@ -995,6 +1020,8 @@ static void reset_calibration_defaults(void) {
     cfg_swap_left_right_motors = SWAP_LEFT_RIGHT_MOTORS_DEFAULT;
     cfg_motor_min_duty_left = MOTOR_MIN_DUTY_LEFT_DEFAULT;
     cfg_motor_min_duty_right = MOTOR_MIN_DUTY_RIGHT_DEFAULT;
+    cfg_motor_min_duty_fwd_adj_left = MOTOR_MIN_DUTY_FWD_ADJ_LEFT_DEFAULT;
+    cfg_motor_min_duty_fwd_adj_right = MOTOR_MIN_DUTY_FWD_ADJ_RIGHT_DEFAULT;
     cfg_motor_kick_duty = MOTOR_KICK_DUTY_DEFAULT;
     cfg_motor_kick_cycles = MOTOR_KICK_CYCLES_DEFAULT;
     cfg_motor_trim_left = MOTOR_TRIM_LEFT_DEFAULT;
@@ -1012,7 +1039,7 @@ static void handle_calibration(uint8_t dev_id, const uint8_t *params, uint16_t n
     }
 
     uint8_t subcmd = params[0];
-    uint8_t out[40];
+    uint8_t out[48];
     uint16_t out_len = 0;
     bool ok = true;
 
@@ -1038,7 +1065,10 @@ static void handle_calibration(uint8_t dev_id, const uint8_t *params, uint16_t n
         write_f32_le(&out[24], cfg_motor_trim_left);
         write_f32_le(&out[28], cfg_motor_trim_right);
         write_f32_le(&out[32], cfg_motor_min_duty_right);
-        out_len = 37u;
+        out[36] = cfg_left_motor_reversed;
+        write_f32_le(&out[37], cfg_motor_min_duty_fwd_adj_left);
+        write_f32_le(&out[41], cfg_motor_min_duty_fwd_adj_right);
+        out_len = 45u;
     } else if (subcmd == CALIB_CMD_RESET) {
         reset_calibration_defaults();
     } else if (subcmd == CALIB_CMD_SAVE) {
@@ -1515,6 +1545,13 @@ static void set_motor(uint8_t i2c_reg, bool reversed, float throttle, int motor_
     // Per-motor values compensate for manufacturing asymmetry.
     float min_duty = (motor_idx == 0) ? cfg_motor_min_duty_left
                                       : cfg_motor_min_duty_right;
+    if (new_dir > 0) {
+        float fwd_adj = (motor_idx == 0) ? cfg_motor_min_duty_fwd_adj_left
+                                         : cfg_motor_min_duty_fwd_adj_right;
+        min_duty += fwd_adj;
+        if (min_duty < 0.0f) min_duty = 0.0f;
+        if (min_duty > 1.0f) min_duty = 1.0f;
+    }
     float mag = fabsf(throttle);
     if (mag > 0.001f && min_duty > 0.0f) {
         mag = min_duty + mag * (1.0f - min_duty);

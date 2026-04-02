@@ -580,13 +580,20 @@ class DiagReverseNode(Node):
             rclpy.spin_once(self, timeout_sec=0.02)
 
     def send(self, lin: float, ang: float = 0.0):
+        if not rclpy.ok():
+            return
         msg = Twist()
         msg.linear.x = lin; msg.angular.z = ang
         self._pub.publish(msg)
 
     def stop(self, settle: float = 0.5):
-        self.send(0.0)
-        self.spin_for(settle)
+        if not rclpy.ok():
+            return
+        try:
+            self.send(0.0)
+            self.spin_for(settle)
+        except Exception:
+            pass
 
     def snapshot(self) -> dict:
         rclpy.spin_once(self, timeout_sec=0.0)

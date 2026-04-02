@@ -45,6 +45,11 @@ KEYS = {
     "motor_trim_right": 0x08,
     "right_motor_reversed": 0x09,
     "swap_motors": 0x0A,
+    "motor_min_duty_left": 0x0B,
+    "motor_min_duty_right": 0x0C,
+    "left_motor_reversed": 0x0D,
+    "motor_min_duty_fwd_adj_left": 0x0E,
+    "motor_min_duty_fwd_adj_right": 0x0F,
 }
 
 
@@ -147,7 +152,7 @@ def send_calibration(ser: serial.Serial, subcmd: int, key: Optional[int] = None,
 
 
 def decode_get_payload(payload: bytes) -> dict:
-    if len(payload) < 32 or payload[0] != CALIB_CMD_GET:
+    if len(payload) < 45 or payload[0] != CALIB_CMD_GET:
         raise ValueError("Unexpected GET payload")
 
     return {
@@ -157,10 +162,15 @@ def decode_get_payload(payload: bytes) -> dict:
         "right_motor_reversed": int(payload[13]),
         "swap_motors": int(payload[14]),
         "motor_min_duty": struct.unpack_from("<f", payload, 15)[0],
+        "motor_min_duty_left": struct.unpack_from("<f", payload, 15)[0],
         "motor_kick_duty": struct.unpack_from("<f", payload, 19)[0],
         "motor_kick_cycles": int(payload[23]),
         "motor_trim_left": struct.unpack_from("<f", payload, 24)[0],
         "motor_trim_right": struct.unpack_from("<f", payload, 28)[0],
+        "motor_min_duty_right": struct.unpack_from("<f", payload, 32)[0],
+        "left_motor_reversed": int(payload[36]),
+        "motor_min_duty_fwd_adj_left": struct.unpack_from("<f", payload, 37)[0],
+        "motor_min_duty_fwd_adj_right": struct.unpack_from("<f", payload, 41)[0],
     }
 
 
