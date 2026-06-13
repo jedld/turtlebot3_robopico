@@ -81,7 +81,7 @@ do_build() {
     #   2 (default) = BNO055 only
     #   3 = SIMULATED only
     # Usage: IMU_TYPE=2 ./build.sh flash
-    local imu_type="${IMU_TYPE:-1}"
+    local imu_type="${IMU_TYPE:-2}"
     echo "    IMU_TYPE=${imu_type}  (0=AUTO 1=BNO085 2=BNO055 3=SIMULATED)"
     mkdir -p "$BUILD_DIR"
     cmake -S "$FIRMWARE_DIR" -B "$BUILD_DIR" \

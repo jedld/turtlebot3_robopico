@@ -34,62 +34,15 @@ from typing import Iterable, Optional
 
 import serial
 
-# ── serial / Dynamixel constants ────────────────────────────────────────────
-DXL_PORT_CANDIDATES = ("/dev/ttyTB3", "/dev/ttyACM0", "/dev/ttyACM1")
-DXL_BAUD = 1_000_000
-DXL_ID = 200
-INST_READ = 0x02
-INST_WRITE = 0x03
+from dxl_utils import *  # noqa: F401,F403 — protocol, registers, colours
 
-# ── firmware register addresses (must match firmware/main.c) ───────────────
-REG_MILLIS = 10
-REG_IMU_ANG_VEL_Z = 68
-REG_MOTOR_TORQUE = 149
-REG_CMD_LINEAR_X = 150
-REG_CMD_ANGULAR_Z = 170
-REG_DBG_IMU_SOURCE = 174
-REG_ENC_L_COUNT = 184
-REG_ENC_R_COUNT = 188
-REG_ENC_RESET = 192
-REG_DBG_VEL_L = 212
-REG_DBG_VEL_R = 216
-REG_HDG_I_SEED_FWD = 256
-REG_HDG_ITERM = 264
-REG_VEL_TRIM_FWD = 268
-REG_HEADING_HOLD_KP = 280
-REG_DBG_HEADING_ERR = 284
-REG_HEADING_HOLD_EN = 288
-REG_HEADING_HOLD_KI = 292
-REG_HEADING_CORR = 296
-REG_ENC_TRIM_KP = 300
-REG_DBG_ENC_TRIM = 304
-REG_DBG_ENC_DIFF = 308
-REG_HEADING_HOLD_KD = 312
-REG_IMU_HEADING_ALPHA = 316
-REG_IMU_HEADING_EN = 320
-REG_DBG_HEADING_FUSED = 324
-REG_DBG_HEADING_GYRO = 328
-REG_DBG_HEADING_ENC = 332
-REG_IMU_HEADING_BIAS_BETA = 336
-REG_DBG_GYRO_BIAS = 340
+# ── script-specific constants ──────────────────────────────────────────────
+DXL_PORT_CANDIDATES = DXL_PORTS
 
 BULK_ADDR = REG_IMU_ANG_VEL_Z
 BULK_LEN = (REG_DBG_GYRO_BIAS + 4) - BULK_ADDR
 
-WHEEL_RADIUS_M = 0.03405
-WHEEL_BASE_M = 0.121642
-ENC_COUNTS_PER_REV = 1936.0
-ENC_M_PER_COUNT = (2.0 * math.pi * WHEEL_RADIUS_M) / ENC_COUNTS_PER_REV
-
-BRINGUP_SERVICE = "turtlebot3-bringup.service"
 IMU_SOURCE_NAMES = {0: "sim", 1: "BNO085", 2: "BNO055", 0xFF: "unknown"}
-
-RED = "\033[0;31m"
-GRN = "\033[0;32m"
-YLW = "\033[1;33m"
-CYN = "\033[0;36m"
-BLD = "\033[1m"
-NC = "\033[0m"
 
 
 @dataclass
@@ -142,111 +95,26 @@ class Summary:
     peak_heading_err_deg: float
 
 
-# ── CRC / packet helpers ────────────────────────────────────────────────────
-_CRC_TABLE: list[int] = []
-for _i in range(256):
-    crc = _i << 8
-    for _ in range(8):
-        if crc & 0x8000:
-            crc = ((crc << 1) ^ 0x8005) & 0xFFFF
-        else:
-            crc = (crc << 1) & 0xFFFF
-    _CRC_TABLE.append(crc)
-
-
-def crc16(data: bytes) -> int:
-    crc = 0
-    for b in data:
-        crc = ((crc << 8) ^ _CRC_TABLE[((crc >> 8) ^ b) & 0xFF]) & 0xFFFF
-    return crc
-
-
-def make_read_pkt(addr: int, length: int) -> bytes:
-    params = struct.pack("<HH", addr, length)
-    plen = len(params) + 3
-    hdr = bytes([0xFF, 0xFF, 0xFD, 0x00, DXL_ID,
-                 plen & 0xFF, (plen >> 8) & 0xFF, INST_READ]) + params
-    crc = crc16(hdr)
-    return hdr + bytes([crc & 0xFF, crc >> 8])
-
-
-def make_write_pkt(addr: int, payload: bytes) -> bytes:
-    params = struct.pack("<H", addr) + payload
-    plen = len(params) + 3
-    hdr = bytes([0xFF, 0xFF, 0xFD, 0x00, DXL_ID,
-                 plen & 0xFF, (plen >> 8) & 0xFF, INST_WRITE]) + params
-    crc = crc16(hdr)
-    return hdr + bytes([crc & 0xFF, crc >> 8])
-
-
-def read_response(ser: serial.Serial, expected: int, timeout: float = 0.25) -> Optional[bytes]:
-    header = b"\xFF\xFF\xFD\x00"
-    t0 = time.monotonic()
-    buf = b""
-    while time.monotonic() - t0 < timeout:
-        chunk = ser.read(ser.in_waiting or 1)
-        if chunk:
-            buf += chunk
-        while True:
-            idx = buf.find(header)
-            if idx < 0:
-                buf = buf[-3:] if len(buf) >= 3 else buf
-                break
-            buf = buf[idx:]
-            if len(buf) < 9:
-                break
-            if buf[4] != DXL_ID or buf[7] != 0x55:
-                buf = buf[4:]
-                continue
-            plen = buf[5] | (buf[6] << 8)
-            num_params = plen - 4
-            total = 7 + plen
-            if len(buf) < total:
-                break
-            if num_params != expected:
-                buf = buf[4:]
-                continue
-            return buf[9:9 + expected]
-    return None
-
-
-def write_u8(ser: serial.Serial, addr: int, value: int) -> None:
-    ser.write(make_write_pkt(addr, bytes([value & 0xFF])))
-    read_response(ser, expected=0, timeout=0.05)
-
-
-def write_i32(ser: serial.Serial, addr: int, value: int) -> None:
-    ser.write(make_write_pkt(addr, struct.pack("<i", value)))
-    read_response(ser, expected=0, timeout=0.05)
-
-
-def write_f32(ser: serial.Serial, addr: int, value: float) -> None:
-    ser.write(make_write_pkt(addr, struct.pack("<f", value)))
-    read_response(ser, expected=0, timeout=0.05)
-
-
+# ── Strict register readers (raise on failure) ──────────────────────────────
 def read_u8(ser: serial.Serial, addr: int) -> int:
-    ser.write(make_read_pkt(addr, 1))
-    data = read_response(ser, expected=1)
-    if not data:
+    val = dxl_read_u8(ser, addr)
+    if val is None:
         raise RuntimeError(f"read_u8 failed at {addr}")
-    return data[0]
+    return val
 
 
 def read_f32(ser: serial.Serial, addr: int) -> float:
-    ser.write(make_read_pkt(addr, 4))
-    data = read_response(ser, expected=4)
-    if not data or len(data) < 4:
+    val = dxl_read_f32(ser, addr)
+    if val is None:
         raise RuntimeError(f"read_f32 failed at {addr}")
-    return struct.unpack_from("<f", data, 0)[0]
+    return val
 
 
 def read_i32(ser: serial.Serial, addr: int) -> int:
-    ser.write(make_read_pkt(addr, 4))
-    data = read_response(ser, expected=4)
-    if not data or len(data) < 4:
+    val = dxl_read_i32(ser, addr)
+    if val is None:
         raise RuntimeError(f"read_i32 failed at {addr}")
-    return struct.unpack_from("<i", data, 0)[0]
+    return val
 
 
 def bulk_read(ser: serial.Serial) -> Optional[Sample]:
@@ -327,9 +195,7 @@ def detect_port(explicit: Optional[str]) -> str:
     raise FileNotFoundError("No TurtleBot3 serial port found")
 
 
-def send_cmd_vel(ser: serial.Serial, lin_x: float, ang_z: float = 0.0) -> None:
-    write_i32(ser, REG_CMD_LINEAR_X, int(round(lin_x * 100.0)))
-    write_i32(ser, REG_CMD_ANGULAR_Z, int(round(ang_z * 100.0)))
+send_cmd_vel = set_velocity  # alias for shared helper
 
 
 def wait_for_device(ser: serial.Serial, timeout_s: float = 5.0) -> None:
@@ -537,6 +403,16 @@ def main() -> int:
             ser.reset_input_buffer()
             ser.reset_output_buffer()
             wait_for_device(ser)
+
+            # Query wheel separation from firmware
+            global WHEEL_BASE_M
+            ws = query_wheel_separation(ser)
+            if ws and ws > 0.01:
+                WHEEL_BASE_M = ws
+            else:
+                WHEEL_BASE_M = 0.185  # fallback to firmware default
+                print(f"{YLW}Warning: could not read wheel separation, using default {WHEEL_BASE_M:.4f} m{NC}")
+            print(f"  Wheel sep:  {WHEEL_BASE_M:.6f} m")
 
             orig_fusion_en = read_u8(ser, REG_IMU_HEADING_EN)
             orig_alpha = read_f32(ser, REG_IMU_HEADING_ALPHA)

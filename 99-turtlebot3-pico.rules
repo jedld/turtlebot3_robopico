@@ -42,5 +42,5 @@ SUBSYSTEM=="tty", \
 # To switch LiDAR model at runtime see LDS_MODEL_OVERRIDE in start_robot.sh.
 SUBSYSTEM=="tty", \
   ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", \
-  SYMLINK+="tb3_lidar", MODE="0666", \
+  SYMLINK+="tb3_lidar ydlidar", MODE="0666", \
   TAG+="uaccess"

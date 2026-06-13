@@ -137,7 +137,7 @@
 #define WHEEL_RADIUS_DEFAULT        0.037009f  // calibrated 2026-03-23
 // ANGULAR CALIBRATION: do NOT use a scale factor (it breaks odometry).
 // Tune WHEEL_SEPARATION to match effective turning base; run auto_calibrate_imu_turn.py.
-#define WHEEL_SEPARATION_DEFAULT    0.185000f  // metres — physical track width 146.5 mm; recalibrate with auto_calibrate_imu_turn.py
+#define WHEEL_SEPARATION_DEFAULT    0.225f  // metres — physical track width 146.5 mm; recalibrate with auto_calibrate_imu_turn.py
 #define MAX_WHEEL_SPEED_MS_DEFAULT  0.067899f  // calibrated 2026-03-18: USS ground truth, correction=0.9165 (-8.3%)
 #define LEFT_MOTOR_REVERSED_DEFAULT  1       // left motor also needs inverted polarity (M1=left)
 #define RIGHT_MOTOR_REVERSED_DEFAULT 1       // right motor needs inverted polarity (M2=right)
@@ -231,20 +231,20 @@
 // gyro smooths inter-sample noise only.  With BNO055 vibration-rectification
 // bias of 3–6 °/s, lower α is essential to keep the biased gyro from dominating.
 // Raise toward 0.8–0.9 only with a clean gyro (e.g. BNO085 with vibration isolation).
-#define IMU_HEADING_COMP_ALPHA_DEFAULT  0.0f  // complementary filter weight (0=encoder only, 1=gyro only)
+#define IMU_HEADING_COMP_ALPHA_DEFAULT  0.3f  // complementary filter weight (0=encoder only, 1=gyro only)
 // Online gyro bias estimator — learns the vibration-rectification DC offset
 // that BNO055 MEMS gyros exhibit under motor vibration (~3-6 °/s).
 // β controls how fast the bias tracks.  At 50 Hz, β=0.02 gives a time
 // constant of ~1 s — fast enough to catch motor-on transients, slow enough
 // to ignore cycle-to-cycle noise.  The bias is subtracted from the raw
 // gyro reading before integration.
-#define IMU_HEADING_BIAS_BETA_DEFAULT   0.02f  // bias estimator learning rate
+#define IMU_HEADING_BIAS_BETA_DEFAULT   0.25f  // bias estimator learning rate
 
 // Derivative gain — damps oscillation by opposing rapid changes in heading error.
 // Acts on d(heading_err)/dt ≈ (v_left − v_right) / wheel_separation.
 // Filtered with a first-order low-pass at HEADING_HOLD_D_FILTER_HZ to suppress
 // encoder noise amplification.
-#define HEADING_HOLD_KD_DEFAULT   0.0f   // D gain — disabled; empirically made wobble worse (encoder noise amplification)
+#define HEADING_HOLD_KD_DEFAULT   0.01f   // D gain — re-enabled 2026-04-07; damps heading oscillation with new JGA25-371 encoders
 #define HEADING_HOLD_D_FILTER_HZ   5.0f  // low-pass cutoff for derivative term (Hz) — lowered for when KD is re-enabled
 
 // Encoder differential trim — equalises left/right wheel distance during
@@ -489,7 +489,7 @@ static bool load_calibration_from_flash(void) {
 // CONTROL TABLE  (register map — must be large enough for all defined ADDR_* + their width)
 // ============================================================
 
-#define REG_SIZE 376u
+#define REG_SIZE 384u
 static uint8_t regs[REG_SIZE];
 
 // --- typed register accessors --------------------------------
@@ -688,6 +688,14 @@ static inline void w_f32(uint addr, float v) {
 #define ADDR_MOTOR_WHO_AM_I     360u  // 1 byte: WHO_AM_I (reg 0x00) read from device at boot; 0xA4 = OK
 #define ADDR_MOTOR_I2C_RECOVERY_CNT 364u  // uint32: number of I2C bus recovery attempts
 
+// Game Rotation Vector quaternion (BNO085 report 0x08) — gyro+accel fused,
+// NO magnetometer.  Use this for yaw comparison instead of ADDR_IMU_ORIENT_*
+// which includes magnetometer and gets corrupted near motor magnets.
+#define ADDR_GAME_ROT_W        368u  // float (R) — game rotation vector w
+#define ADDR_GAME_ROT_X        372u  // float (R) — game rotation vector x
+#define ADDR_GAME_ROT_Y        376u  // float (R) — game rotation vector y
+#define ADDR_GAME_ROT_Z        380u  // float (R) — game rotation vector z
+
 // I2C bus recovery: if consecutive errors exceed this threshold, bit-bang
 // SCL to unstick the bus, re-init I2C, and re-probe the motor driver.
 #define MOTOR_I2C_ERR_RECOVERY_THRESHOLD  50u
@@ -769,6 +777,12 @@ static void init_registers(void) {
     // IMU gyro bias estimator — zero initial bias; converges online.
     w_f32(ADDR_IMU_HEADING_BIAS_BETA, IMU_HEADING_BIAS_BETA_DEFAULT);
     w_f32(ADDR_DBG_GYRO_BIAS, 0.0f);
+
+    // Game Rotation Vector — initialise to identity quaternion.
+    w_f32(ADDR_GAME_ROT_W, 1.0f);
+    w_f32(ADDR_GAME_ROT_X, 0.0f);
+    w_f32(ADDR_GAME_ROT_Y, 0.0f);
+    w_f32(ADDR_GAME_ROT_Z, 0.0f);
 
     // Motor I2C1 diagnostics — sentinel until init_motors() runs
     regs[ADDR_MOTOR_I2C_NDEV]    = 0u;
@@ -1909,6 +1923,7 @@ static void init_encoders(void) {
 #define SH2_GYROSCOPE_CAL     0x02u
 #define SH2_MAG_FIELD_CAL     0x03u   // SH-2 §6.5.16: Magnetic Field Calibrated
 #define SH2_ROTATION_VECTOR   0x05u
+#define SH2_GAME_ROT_VECTOR   0x08u   // Game Rotation Vector — gyro+accel fused quaternion, NO magnetometer
 #define SH2_SET_FEATURE_CMD   0xFDu
 #define SH2_COMMAND_REQUEST   0xF2u
 
@@ -2140,6 +2155,27 @@ static void bno085_parse_cargo(const uint8_t *cargo, uint16_t len) {
             w_f32(ADDR_IMU_MAG_Y, ry);
             w_f32(ADDR_IMU_MAG_Z, rz);
             off += 10u;
+        }
+        else if (rid == SH2_GAME_ROT_VECTOR) {
+            // 14-byte report (same layout as Rotation Vector):
+            //   [0] report ID  [1] seq  [2] status  [3] delay
+            //   [4-5] i (Q14)  [6-7] j (Q14)  [8-9] k (Q14)  [10-11] real (Q14)
+            //   [12-13] accuracy (unused for game rotation vector)
+            // No magnetometer — immune to motor magnet contamination.
+            if (off + 14u > len) break;
+            int16_t gi = (int16_t)((uint16_t)cargo[off+ 4] | ((uint16_t)cargo[off+ 5] << 8u));
+            int16_t gj = (int16_t)((uint16_t)cargo[off+ 6] | ((uint16_t)cargo[off+ 7] << 8u));
+            int16_t gk = (int16_t)((uint16_t)cargo[off+ 8] | ((uint16_t)cargo[off+ 9] << 8u));
+            int16_t gr = (int16_t)((uint16_t)cargo[off+10] | ((uint16_t)cargo[off+11] << 8u));
+            float qx = 0.0f, qy = 0.0f, qz = 0.0f, qw = 1.0f;
+            imu_mount_remap_quaternion(gi * Q14_SCALE, gj * Q14_SCALE,
+                                       gk * Q14_SCALE, gr * Q14_SCALE,
+                                       &qx, &qy, &qz, &qw);
+            w_f32(ADDR_GAME_ROT_X, qx);
+            w_f32(ADDR_GAME_ROT_Y, qy);
+            w_f32(ADDR_GAME_ROT_Z, qz);
+            w_f32(ADDR_GAME_ROT_W, qw);
+            off += 14u;
         }
         else if (rid == 0xFBu) {
             // Base Timestamp Reference (SH-2 §1.3.4): 5-byte header that the BNO085
@@ -2373,6 +2409,10 @@ static bool init_bno085(void) {
     for (int i = 0; i < 4; i++) { shtp_receive(tmp, sizeof(tmp), &ch); sleep_us(1000u); }
 
     bno085_enable_report(SH2_MAG_FIELD_CAL,   period_us);
+    sleep_ms(20u);
+    for (int i = 0; i < 4; i++) { shtp_receive(tmp, sizeof(tmp), &ch); sleep_us(1000u); }
+
+    bno085_enable_report(SH2_GAME_ROT_VECTOR, period_us);
     sleep_ms(20u);
     for (int i = 0; i < 4; i++) { shtp_receive(tmp, sizeof(tmp), &ch); sleep_us(1000u); }
 
@@ -2826,9 +2866,9 @@ static void update_odometry(float dt) {
             // (we subtract more next cycle).  Sign: Δb = −β·innovation.
             gyro_bias_est -= beta * innovation;
 
-            // Clamp bias to a sane range (±0.25 rad/s ≈ ±14 °/s).
-            if (gyro_bias_est >  0.25f) gyro_bias_est =  0.25f;
-            if (gyro_bias_est < -0.25f) gyro_bias_est = -0.25f;
+            // Clamp bias to a sane range (±0.50 rad/s ≈ ±29 °/s).
+            if (gyro_bias_est >  0.50f) gyro_bias_est =  0.50f;
+            if (gyro_bias_est < -0.50f) gyro_bias_est = -0.50f;
 
             heading_err = heading_fused;
         } else {

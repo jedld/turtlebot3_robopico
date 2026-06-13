@@ -47,8 +47,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from sensor_msgs.msg import Imu, JointState, Range
 
 # ── colours ───────────────────────────────────────────────────────────────────
-RED = "\033[0;31m"; GRN = "\033[0;32m"; YLW = "\033[1;33m"
-CYN = "\033[0;36m"; BLD = "\033[1m";    NC  = "\033[0m"
+from dxl_utils import *  # noqa: F401,F403 — protocol, registers, colours
 
 # ── ROS QoS ──────────────────────────────────────────────────────────────────
 BEST_EFFORT_QOS = QoSProfile(
@@ -58,49 +57,18 @@ BEST_EFFORT_QOS = QoSProfile(
     depth=10,
 )
 
-# ── Dynamixel constants ───────────────────────────────────────────────────────
-DXL_PORTS   = ("/dev/ttyTB3", "/dev/ttyACM0", "/dev/ttyACM1")
-DXL_ID      = 200
-DXL_BAUD    = 1_000_000
-
-# Register map (matches firmware/main.c)
-REG_PRESENT_VEL_L  = 128   # int32  — Dynamixel RPM units
-REG_PRESENT_VEL_R  = 132   # int32
-REG_PRESENT_POS_L  = 136   # int32  — Dynamixel ticks
-REG_PRESENT_POS_R  = 140   # int32
-REG_ENC_L_COUNT    = 184   # int32  — raw quadrature counts
-REG_ENC_R_COUNT    = 188   # int32
-REG_DBG_VEL_L      = 212   # float  — measured velocity m/s
-REG_DBG_VEL_R      = 216   # float
-# NOTE: 240–255 are DIAG counters in the firmware — heading-hold regs start at 280.
-REG_HEADING_HOLD_KP= 280   # float
-REG_DBG_HEADING_ERR= 284   # float  — heading error (rad)
-REG_HEADING_HOLD_EN= 288   # uint8
-REG_HEADING_HOLD_KI= 292   # float
-REG_HEADING_CORR   = 296   # float  — ang_z correction (rad/s)
-REG_ENC_TRIM_KP    = 300   # float
-REG_DBG_ENC_TRIM   = 304   # float
-REG_DBG_ENC_DIFF   = 308   # float  — accumulated L−R distance (m)
-REG_HEADING_HOLD_KD= 312   # float  — D gain for heading hold
-
-# IMU gyro-Z (firmware addr 68 — included in bulk read for wobble detection)
-REG_IMU_ANG_VEL_Z  = 68   # float  — gyro Z rad/s
-
+# ── Script-specific constants ─────────────────────────────────────────────────
 # Bulk read: start at IMU gyro-Z (68) to capture all firmware regs in one shot.
-# 68..315 = 248 bytes.  Firmware REG_SIZE=316 so max addr 315 is in range.
 BULK_ADDR   = REG_IMU_ANG_VEL_Z   # 68
 BULK_LEN    = (REG_HEADING_HOLD_KD - BULK_ADDR) + 4  # 248 bytes  (68..315)
 
-WHEEL_RADIUS   = 0.033   # m
-WHEEL_BASE     = 0.121642  # m — effective turning base (from firmware WHEEL_SEPARATION_DEFAULT)
+WHEEL_RADIUS   = 0.033   # m  (approx, used for Dynamixel RPM → m/s)
 DXL_VEL_UNIT   = 0.229   # RPM per unit
 RPM_TO_RADS    = 2.0 * math.pi / 60.0
 
 # ── Ultrasonic collision detection ────────────────────────────────────────────
-# Default GPIO pins for the Grove ultrasonic sensors (BCM numbering)
 US_LEFT_GPIO   = 23
 US_RIGHT_GPIO  = 24
-# Minimum distance (mm) — if either sensor reads below this, emergency stop.
 US_COLLISION_MM = 150.0   # 15 cm
 
 
@@ -219,112 +187,6 @@ class UltrasonicGuard:
                 return
             time.sleep(0.06)  # ~10 Hz per sensor
 
-
-# ── Dynamixel write helper ────────────────────────────────────────────────────
-REG_CMD_LINEAR_X  = 150   # int32, units of 0.01 m/s
-REG_CMD_ANGULAR_Z = 170   # int32, units of 0.01 rad/s
-REG_MOTOR_TORQUE  = 149   # uint8
-REG_PID_KP        = 200   # float — velocity PID proportional
-REG_PID_KI        = 204   # float — velocity PID integral
-REG_PID_KD        = 208   # float — velocity PID derivative
-
-# Feedforward integral seed — pre-loads heading-hold integral to eliminate
-# startup transient.  Learned from steady-state correction during calibration.
-REG_HDG_I_SEED_FWD = 256  # float — integral seed when driving forward
-REG_HDG_I_SEED_REV = 260  # float — integral seed when driving reverse
-REG_HDG_ITERM      = 264  # float — current integral accumulator (read-only)
-REG_VEL_TRIM_FWD   = 268  # float — velocity feedforward trim, forward (m/s)
-REG_VEL_TRIM_REV   = 272  # float — velocity feedforward trim, reverse (m/s)
-
-def _make_write_i32_pkt(addr: int, value: int) -> bytes:
-    params  = struct.pack("<H", addr) + struct.pack("<i", value)
-    plen    = len(params) + 3
-    hdr     = bytes([0xFF, 0xFF, 0xFD, 0x00, DXL_ID,
-                     plen & 0xFF, (plen >> 8) & 0xFF, 0x03]) + params
-    crc     = _crc16(hdr)
-    return hdr + bytes([crc & 0xFF, crc >> 8])
-
-def _make_write_f32_pkt(addr: int, value: float) -> bytes:
-    """Create a Dynamixel v2 WRITE packet for a 32-bit float register."""
-    params  = struct.pack("<H", addr) + struct.pack("<f", value)
-    plen    = len(params) + 3
-    hdr     = bytes([0xFF, 0xFF, 0xFD, 0x00, DXL_ID,
-                     plen & 0xFF, (plen >> 8) & 0xFF, 0x03]) + params
-    crc     = _crc16(hdr)
-    return hdr + bytes([crc & 0xFF, crc >> 8])
-
-def _make_write_u8_pkt(addr: int, value: int) -> bytes:
-    """Create a Dynamixel v2 WRITE packet for a single uint8 register."""
-    params  = struct.pack("<H", addr) + bytes([value & 0xFF])
-    plen    = len(params) + 3
-    hdr     = bytes([0xFF, 0xFF, 0xFD, 0x00, DXL_ID,
-                     plen & 0xFF, (plen >> 8) & 0xFF, 0x03]) + params
-    crc     = _crc16(hdr)
-    return hdr + bytes([crc & 0xFF, crc >> 8])
-_CRC_TABLE = []
-for _i in range(256):
-    _c = _i << 8
-    for _ in range(8):
-        _c = ((_c << 1) ^ 0x8005) & 0xFFFF if (_c & 0x8000) else ((_c << 1) & 0xFFFF)
-    _CRC_TABLE.append(_c)
-
-def _crc16(data: bytes) -> int:
-    crc = 0
-    for b in data:
-        crc = ((crc << 8) ^ _CRC_TABLE[((crc >> 8) ^ b) & 0xFF]) & 0xFFFF
-    return crc
-
-def _make_read_pkt(addr: int, length: int) -> bytes:
-    params  = struct.pack("<HH", addr, length)
-    plen    = len(params) + 3
-    hdr     = bytes([0xFF, 0xFF, 0xFD, 0x00, DXL_ID,
-                     plen & 0xFF, (plen >> 8) & 0xFF, 0x02]) + params
-    crc     = _crc16(hdr)
-    return hdr + bytes([crc & 0xFF, crc >> 8])
-
-def _read_response(ser, expected: int, timeout: float = 0.25) -> Optional[bytes]:
-    """Read a Dynamixel v2 status packet, verifying device ID, instruction, and length.
-    Skips over packets that don't match our expected device / size so concurrent
-    turtlebot3_node traffic doesn't corrupt the result.
-
-    Key invariant: when the 4-byte header is not yet fully in buf, we keep up to
-    3 trailing bytes as a potential partial match (e.g. buf ends with \\xff\\xff\\xfd
-    before the \\x00 arrives).  Discarding those bytes would split the header across
-    two read() calls and cause the search to miss it permanently.
-    """
-    HEADER = b"\xFF\xFF\xFD\x00"
-    t0  = time.monotonic()
-    buf = b""
-    while time.monotonic() - t0 < timeout:
-        waiting = ser.in_waiting
-        chunk = ser.read(waiting if waiting > 0 else 1)
-        if chunk:
-            buf += chunk
-        # Search for valid header, validating each candidate
-        while True:
-            idx = buf.find(HEADER)
-            if idx < 0:
-                # No complete header found — keep the last 3 bytes in case they
-                # are the start of \xff\xff\xfd that is split across two reads.
-                buf = buf[-3:] if len(buf) >= 3 else buf
-                break
-            buf = buf[idx:]
-            if len(buf) < 9:
-                break  # need more data for ID + len + instr fields
-            # Verify device ID (byte 4) and instruction 0x55 (status, byte 7)
-            if buf[4] != DXL_ID or buf[7] != 0x55:
-                buf = buf[4:]  # skip this header candidate and search again
-                continue
-            plen = buf[5] | (buf[6] << 8)   # length field: INSTR+ERROR+PARAMS+CRC2
-            num_params = plen - 4            # subtract INSTR(1)+ERROR(1)+CRC(2)
-            total      = 7 + plen            # full packet size including 4-byte header
-            if len(buf) < total:
-                break  # packet not fully received yet, keep reading
-            if num_params != expected:
-                buf = buf[4:]  # wrong payload size — skip and search again
-                continue
-            return buf[9:9 + expected]       # correct packet: return payload bytes
-    return None
 
 # ── Firmware register snapshot ────────────────────────────────────────────────
 @dataclass
@@ -634,7 +496,7 @@ class SerialPoller:
         import serial as _serial
         self._ser = _serial.Serial(port, DXL_BAUD, timeout=0.05)
         time.sleep(0.1)
-        self._pkt     = _make_read_pkt(BULK_ADDR, BULK_LEN)
+        self._pkt     = make_read_pkt(BULK_ADDR, BULK_LEN)
         self._data_lock = threading.Lock()   # protects _latest
         self._bus_lock  = threading.Lock()   # serialises all serial I/O (half-duplex bus)
         self._latest: Optional[FwRegs] = None
@@ -650,7 +512,7 @@ class SerialPoller:
                 with self._bus_lock:
                     self._ser.reset_input_buffer()
                     self._ser.write(self._pkt)
-                    raw = _read_response(self._ser, BULK_LEN)
+                    raw = read_response(self._ser, BULK_LEN)
                 if raw:
                     regs = _parse_bulk(raw)
                     if regs:
@@ -676,14 +538,23 @@ class SerialPoller:
         ang_val = int(round(ang_z_rads * 100.0))   # rad/s → 0.01 rad/s units
         try:
             with self._bus_lock:
-                self._ser.write(_make_write_i32_pkt(REG_CMD_LINEAR_X,  lin_val))
+                self._ser.write(make_write_pkt(REG_CMD_LINEAR_X, struct.pack("<i", lin_val)))
                 # Read (and discard) the firmware's write-acknowledge STATUS packet
                 # so it doesn't accumulate in the RX buffer for the poller thread.
                 self._ser.read(11)   # typical write-ACK: 4 hdr + ID + len_l + len_h + instr + err + crc2
-                self._ser.write(_make_write_i32_pkt(REG_CMD_ANGULAR_Z, ang_val))
+                self._ser.write(make_write_pkt(REG_CMD_ANGULAR_Z, struct.pack("<i", ang_val)))
                 self._ser.read(11)
         except Exception:
             pass
+
+    def query_wheel_separation(self) -> Optional[float]:
+        """Read wheel separation from firmware calibration blob."""
+        try:
+            with self._bus_lock:
+                return query_wheel_separation(self._ser)
+        except Exception:
+            pass
+        return None
 
     def close(self):
         self._running = False
@@ -880,12 +751,12 @@ def _analyze_startup(ser, speed: float, burst_s: float = 0.6) -> dict:
       - first_move_l_ms, first_move_r_ms: time until each encoder starts moving
       - samples:      raw list of (t_ms, enc_l, enc_r, vel_l, vel_r, hdg_err, gyro_z)
     """
-    READ_PKT = _make_read_pkt(BULK_ADDR, BULK_LEN)
+    READ_PKT = make_read_pkt(BULK_ADDR, BULK_LEN)
 
     def _fast_read(ser) -> Optional[FwRegs]:
         ser.reset_input_buffer()
         ser.write(READ_PKT)
-        raw = _read_response(ser, BULK_LEN, timeout=0.05)
+        raw = read_response(ser, BULK_LEN, timeout=0.05)
         return _parse_bulk(raw) if raw else None
 
     # Take a baseline snapshot before commanding velocity
@@ -1000,16 +871,16 @@ def run_serial_drive_pass(poller: "SerialPoller",
     concurrent write and that the poller's _read_response timeout can never
     fire mid-response.
     """
-    READ_PKT = _make_read_pkt(BULK_ADDR, BULK_LEN)
+    READ_PKT = make_read_pkt(BULK_ADDR, BULK_LEN)
 
     def _send_vel(ser, v: float, a: float = 0.0) -> None:
         """Write lin_x and ang_z registers; discard any write-ACK bytes."""
         lin_val = int(round(v * 100.0))
         ang_val = int(round(a * 100.0))
-        ser.write(_make_write_i32_pkt(REG_CMD_LINEAR_X, lin_val))
+        ser.write(make_write_pkt(REG_CMD_LINEAR_X, struct.pack("<i", lin_val)))
         time.sleep(0.003)                  # let firmware ACK (11 bytes ≈ 0.11 ms at 1 Mbaud)
         ser.read(max(ser.in_waiting, 1))   # drain write-ACK without blocking on fixed count
-        ser.write(_make_write_i32_pkt(REG_CMD_ANGULAR_Z, ang_val))
+        ser.write(make_write_pkt(REG_CMD_ANGULAR_Z, struct.pack("<i", ang_val)))
         time.sleep(0.003)
         ser.read(max(ser.in_waiting, 1))
 
@@ -1017,7 +888,7 @@ def run_serial_drive_pass(poller: "SerialPoller",
         """Send one bulk READ and parse the response.  ~2 ms at 1 Mbaud."""
         ser.reset_input_buffer()
         ser.write(READ_PKT)
-        raw = _read_response(ser, BULK_LEN)
+        raw = read_response(ser, BULK_LEN)
         return _parse_bulk(raw) if raw else None
 
     samples: list[Sample] = []
@@ -1249,30 +1120,30 @@ def _send_vel_cmd(ser, v: float, a: float = 0.0) -> None:
     """
     lin_val = int(round(v * 100.0))
     ang_val = int(round(a * 100.0))
-    ser.write(_make_write_i32_pkt(REG_CMD_LINEAR_X, lin_val))
+    ser.write(make_write_pkt(REG_CMD_LINEAR_X, struct.pack("<i", lin_val)))
     time.sleep(0.003)
     ser.read(max(ser.in_waiting, 1))
-    ser.write(_make_write_i32_pkt(REG_CMD_ANGULAR_Z, ang_val))
+    ser.write(make_write_pkt(REG_CMD_ANGULAR_Z, struct.pack("<i", ang_val)))
     time.sleep(0.003)
     ser.read(max(ser.in_waiting, 1))
 
 def _write_f32(ser, addr: int, value: float) -> None:
     """Write a float register via Dynamixel, draining the write-ACK."""
-    ser.write(_make_write_f32_pkt(addr, value))
+    ser.write(make_write_pkt(addr, struct.pack("<f", value)))
     time.sleep(0.003)
     ser.read(max(ser.in_waiting, 1))
 
 def _write_u8(ser, addr: int, value: int) -> None:
     """Write a uint8 register via Dynamixel, draining the write-ACK."""
-    ser.write(_make_write_u8_pkt(addr, value))
+    ser.write(make_write_pkt(addr, bytes([value & 0xFF])))
     time.sleep(0.003)
     ser.read(max(ser.in_waiting, 1))
 
 def _read_regs_inline(ser) -> Optional[FwRegs]:
     """Do a single inline bulk-read and parse. Assumes bus is idle."""
     ser.reset_input_buffer()
-    ser.write(_make_read_pkt(BULK_ADDR, BULK_LEN))
-    raw = _read_response(ser, BULK_LEN, timeout=0.15)
+    ser.write(make_read_pkt(BULK_ADDR, BULK_LEN))
+    raw = read_response(ser, BULK_LEN, timeout=0.15)
     return _parse_bulk(raw) if raw else None
 
 def _collect_wobble_window(ser, speed: float, window_s: float = 3.0,
@@ -1905,8 +1776,8 @@ def run_auto_tune(poller, speed: float, max_rounds: int = 12,
 def _read_register_raw(ser, addr: int, length: int = 4) -> Optional[bytes]:
     """Read raw bytes from a single register (inline, bus must be idle)."""
     ser.reset_input_buffer()
-    ser.write(_make_read_pkt(addr, length))
-    return _read_response(ser, length, timeout=0.15)
+    ser.write(make_read_pkt(addr, length))
+    return read_response(ser, length, timeout=0.15)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -2018,7 +1889,7 @@ def main():
             try:
                 import serial as _serial_mod2
                 _probe_ser = _serial_mod2.Serial(port, DXL_BAUD, timeout=0.5)
-                _probe_pkt = _make_read_pkt(BULK_ADDR, BULK_LEN)
+                _probe_pkt = make_read_pkt(BULK_ADDR, BULK_LEN)
                 _probe_ser.reset_input_buffer()
                 _probe_ser.write(_probe_pkt)
                 _raw = _probe_ser.read(256)
